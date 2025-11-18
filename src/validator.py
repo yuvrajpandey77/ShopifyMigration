@@ -82,8 +82,8 @@ class DataValidator:
                 if not self._is_valid_price(value_str):
                     errors.append(f"Row {row_number}: Invalid price format in '{field}': {value_str}")
             
-            # Validate inventory fields
-            if 'Inventory' in field or 'Qty' in field:
+            # Validate inventory quantity fields (but not Inventory tracker which is a string)
+            if ('Inventory' in field or 'Qty' in field) and 'tracker' not in field.lower():
                 if not self._is_valid_inventory(value_str):
                     errors.append(f"Row {row_number}: Invalid inventory in '{field}': {value_str}")
             

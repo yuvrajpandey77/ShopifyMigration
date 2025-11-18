@@ -122,7 +122,7 @@ class CSVHandler:
         self,
         df: pd.DataFrame,
         file_path: str,
-        encoding: str = 'utf-8-sig',  # UTF-8 with BOM for Excel compatibility
+        encoding: str = 'utf-8',  # UTF-8 without BOM to match Shopify template
         index: bool = False,
         **kwargs
     ) -> None:
@@ -132,7 +132,7 @@ class CSVHandler:
         Args:
             df: DataFrame to write
             file_path: Output file path
-            encoding: Encoding to use (default: utf-8-sig for Excel)
+            encoding: Encoding to use (default: utf-8 to match Shopify template)
             index: Whether to write row indices
             **kwargs: Additional arguments to pass to df.to_csv
         """
@@ -142,10 +142,18 @@ class CSVHandler:
         logger.info(f"Writing CSV file: {file_path} ({len(df)} rows)")
         
         try:
+            # Ensure all columns are strings and handle NaN values properly
+            df = df.copy()
+            for col in df.columns:
+                df[col] = df[col].fillna('').astype(str)
+                # Replace 'nan' string with empty string
+                df[col] = df[col].replace('nan', '')
+            
             df.to_csv(
                 file_path,
                 encoding=encoding,
                 index=index,
+                lineterminator='\n',  # Use Unix line endings
                 **kwargs
             )
             logger.info(f"Successfully wrote CSV file: {file_path}")

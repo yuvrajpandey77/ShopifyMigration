@@ -50,7 +50,7 @@
             "field": "Stock",
             "operator": "empty",
             "value": "",
-            "then": "not tracked",
+            "then": "shopify",
             "else": "shopify"
           }
         }
@@ -68,9 +68,10 @@
         "Option1 name": "Default",
         "Option1 value": "Default",
         "Inventory tracker": "shopify",
-        "Continue selling when out of stock": "FALSE",
+        "Continue selling when out of stock": "deny",
         "Requires shipping": "TRUE",
-        "Charge tax": "TRUE"
+        "Charge tax": "TRUE",
+        "Fulfillment service": "manual"
       }
     }
   },

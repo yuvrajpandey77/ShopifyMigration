@@ -36,8 +36,10 @@ class DataTransformer:
             # Handle different field types
             if 'Price' in field or 'Compare At Price' in field or 'Compare-at price' in field:
                 transformed[field] = self._transform_price(value)
-            elif 'Inventory' in field or 'Qty' in field or 'quantity' in field.lower():
+            elif 'Inventory' in field and 'quantity' in field.lower():
                 transformed[field] = self._transform_inventory(value)
+            elif 'Inventory tracker' in field:
+                transformed[field] = self._transform_inventory_tracker(value)
             elif 'Image' in field:
                 transformed[field] = self._transform_image_url(value)
             elif 'Tags' in field:
@@ -46,10 +48,46 @@ class DataTransformer:
                 transformed[field] = self._transform_handle(value)
             elif 'Body' in field or 'Description' in field:
                 transformed[field] = self._transform_html(value)
-            elif 'Published' in field or 'Status' in field:
+            elif 'Published' in field:
                 transformed[field] = self._transform_boolean(value)
+            elif field == 'Status':
+                # Status should be 'active' or 'draft', not TRUE/FALSE
+                transformed[field] = self._transform_status(value)
+            elif 'Continue selling' in field or 'Inventory policy' in field:
+                transformed[field] = self._transform_inventory_policy(value)
+            elif 'Fulfillment service' in field:
+                # Fulfillment service depends on inventory tracker
+                # Will be set after inventory tracker is processed
+                pass
             elif 'SEO' in field:
                 transformed[field] = self._transform_seo(value)
+        
+        # Handle fulfillment service based on inventory tracker
+        # Shopify rule: 
+        # - If inventory tracker is "shopify", fulfillment service should be "manual"
+        # - If inventory tracker is "not tracked", fulfillment service must be empty
+        # Default: Always use "shopify" + "manual" for compatibility
+        if 'Fulfillment service' in transformed:
+            inventory_tracker = transformed.get('Inventory tracker', 'shopify')
+            if inventory_tracker == 'not tracked' or inventory_tracker == '' or str(inventory_tracker).lower() == 'not tracked':
+                # When inventory is not tracked, fulfillment service must be empty
+                transformed['Fulfillment service'] = ''
+            else:
+                # Default: If inventory is tracked (shopify), set to 'manual'
+                transformed['Fulfillment service'] = 'manual'
+        
+        # Ensure fulfillment service is always set (default to 'manual' if empty)
+        if 'Fulfillment service' in transformed:
+            if not transformed.get('Fulfillment service') or transformed.get('Fulfillment service') == '':
+                # If empty, default to 'manual' and set inventory tracker to 'shopify'
+                transformed['Fulfillment service'] = 'manual'
+                transformed['Inventory tracker'] = 'shopify'
+        
+        # Ensure "Continue selling when out of stock" (Inventory policy) is set correctly
+        if 'Continue selling when out of stock' in transformed:
+            policy = transformed.get('Continue selling when out of stock', '')
+            if not policy or pd.isna(policy) or str(policy).strip() == '':
+                transformed['Continue selling when out of stock'] = 'deny'
         
         return transformed
     
@@ -78,6 +116,58 @@ class DataTransformer:
         except (ValueError, TypeError) as e:
             logger.warning(f"Could not transform price '{value}': {e}")
             return "0.00"
+    
+    def _transform_inventory_tracker(self, value: Any) -> str:
+        """
+        Transform inventory tracker to Shopify format.
+        
+        Args:
+            value: Inventory tracker value
+            
+        Returns:
+            "shopify" or "not tracked"
+        """
+        if pd.isna(value) or value is None:
+            return "not tracked"
+        
+        value_str = str(value).strip().lower()
+        
+        # Handle numeric values
+        if value_str in ['0', '0.0']:
+            return "not tracked"
+        elif value_str in ['1', '1.0']:
+            return "shopify"
+        
+        # Handle string values
+        if 'not tracked' in value_str or value_str == '':
+            return "not tracked"
+        elif 'shopify' in value_str:
+            return "shopify"
+        else:
+            # Default to shopify if we have any value
+            return "shopify"
+    
+    def _transform_inventory_policy(self, value: Any) -> str:
+        """
+        Transform inventory policy (Continue selling when out of stock) to Shopify format.
+        
+        Args:
+            value: Inventory policy value
+            
+        Returns:
+            "deny" or "continue"
+        """
+        if pd.isna(value) or value is None:
+            return "deny"
+        
+        value_str = str(value).strip().lower()
+        
+        if value_str in ['true', '1', 'yes', 'y', 'continue', 'allow']:
+            return "continue"
+        elif value_str in ['false', '0', 'no', 'n', 'deny', 'deny']:
+            return "deny"
+        else:
+            return "deny"
     
     def _transform_inventory(self, value: Any) -> str:
         """
@@ -237,28 +327,56 @@ class DataTransformer:
         
         return html
     
+    def _transform_status(self, value: Any) -> str:
+        """
+        Transform status value to Shopify format (active/draft).
+        
+        Args:
+            value: Status value
+            
+        Returns:
+            "active" or "draft"
+        """
+        if pd.isna(value):
+            return "draft"
+        
+        value_str = str(value).strip().upper()
+        
+        if value_str in ['TRUE', '1', 'YES', 'Y', 'ACTIVE', 'PUBLISHED']:
+            return "active"
+        elif value_str in ['FALSE', '0', 'NO', 'N', 'INACTIVE', 'DRAFT']:
+            return "draft"
+        else:
+            # If it's already 'active' or 'draft', return as is
+            if value_str.lower() in ['active', 'draft']:
+                return value_str.lower()
+            logger.warning(f"Unknown status value: {value}, defaulting to draft")
+            return "draft"
+    
     def _transform_boolean(self, value: Any) -> str:
         """
-        Transform boolean value to Shopify format (TRUE/FALSE).
+        Transform boolean value to Shopify format.
+        For "Published on online store": "True" or "False" (capitalized)
+        For "Status": "active" or "draft" (lowercase)
         
         Args:
             value: Boolean value
             
         Returns:
-            "TRUE" or "FALSE"
+            "True"/"False" for published fields, "active"/"draft" for status
         """
         if pd.isna(value):
-            return "FALSE"
+            return "False"
         
         value_str = str(value).strip().upper()
         
         if value_str in ['TRUE', '1', 'YES', 'Y', 'ACTIVE', 'PUBLISHED']:
-            return "TRUE"
+            return "True"
         elif value_str in ['FALSE', '0', 'NO', 'N', 'INACTIVE', 'DRAFT']:
-            return "FALSE"
+            return "False"
         else:
-            logger.warning(f"Unknown boolean value: {value}, defaulting to FALSE")
-            return "FALSE"
+            logger.warning(f"Unknown boolean value: {value}, defaulting to False")
+            return "False"
     
     def _transform_seo(self, value: Any) -> str:
         """
