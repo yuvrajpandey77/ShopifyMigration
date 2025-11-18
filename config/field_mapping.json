@@ -1,0 +1,99 @@
+{
+  "mappings": {
+    "direct": {
+      "comment": "Direct field mappings - source field maps directly to Shopify field",
+      "fields": {
+        "Name": "Title",
+        "SKU": "SKU",
+        "Description": "Description",
+        "Regular price": "Price",
+        "Sale price": "Compare-at price",
+        "Images": "Product image URL",
+        "Type": "Type",
+        "Tags": "Tags",
+        "Published": "Published on online store",
+        "Stock": "Inventory quantity",
+        "In stock?": "Status",
+        "Weight (lbs)": "Weight value (grams)"
+      }
+    },
+    "concatenate": {
+      "comment": "Concatenate multiple source fields into one Shopify field",
+      "fields": {}
+    },
+    "conditional": {
+      "comment": "Conditional mappings based on source data",
+      "fields": {
+        "status": {
+          "target": "Status",
+          "condition": {
+            "field": "In stock?",
+            "operator": "==",
+            "value": "1",
+            "then": "active",
+            "else": "draft"
+          }
+        },
+        "published": {
+          "target": "Published on online store",
+          "condition": {
+            "field": "Published",
+            "operator": "==",
+            "value": "1",
+            "then": "TRUE",
+            "else": "FALSE"
+          }
+        },
+        "inventory_tracker": {
+          "target": "Inventory tracker",
+          "condition": {
+            "field": "Stock",
+            "operator": "empty",
+            "value": "",
+            "then": "not tracked",
+            "else": "shopify"
+          }
+        }
+      }
+    },
+    "transform": {
+      "comment": "Fields that need transformation (format, type conversion, etc.)",
+      "fields": {}
+    },
+    "default": {
+      "comment": "Default values for Shopify fields not in source",
+      "fields": {
+        "Vendor": "Default Vendor",
+        "Product category": "",
+        "Option1 name": "Default",
+        "Option1 value": "Default",
+        "Inventory tracker": "shopify",
+        "Continue selling when out of stock": "FALSE",
+        "Requires shipping": "TRUE",
+        "Charge tax": "TRUE"
+      }
+    }
+  },
+  "required_fields": [
+    "Title",
+    "SKU",
+    "Price"
+  ],
+  "optional_fields": [
+    "URL handle",
+    "Description",
+    "Vendor",
+    "Product category",
+    "Type",
+    "Tags",
+    "Published on online store",
+    "Status",
+    "Compare-at price",
+    "Inventory tracker",
+    "Inventory quantity",
+    "Product image URL",
+    "SEO title",
+    "SEO description"
+  ]
+}
+

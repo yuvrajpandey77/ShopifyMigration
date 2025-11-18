@@ -1,0 +1,20 @@
+files:
+  source_csv: "/home/yuvraj/Documents/products.csv"  # Path to your source products CSV file
+  shopify_template: "/home/yuvraj/Documents/productstemplate.csv"  # Path to Shopify template CSV file
+  output_dir: "./data/output"
+  
+migration:
+  sample_size: 10  # Number of products for initial testing
+  chunk_size: 1000  # Process in chunks for large files
+  continue_on_error: true  # Continue processing even if some rows fail
+  
+validation:
+  strict_mode: false  # If true, stop on first error
+  skip_invalid_rows: true  # Skip rows with critical errors
+  log_all_warnings: true  # Log all warnings, not just errors
+  
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_file: "./logs/migration_{date}.log"
+  console_output: true
+
