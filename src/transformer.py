@@ -127,8 +127,10 @@ class DataTransformer:
         Returns:
             "shopify" or "not tracked"
         """
+        # Default to "shopify" for variants (will be overridden in migration.py if needed)
+        # This ensures variants with inventory quantity are tracked by default
         if pd.isna(value) or value is None:
-            return "not tracked"
+            return "shopify"  # Changed from "not tracked" to "shopify" as default
         
         value_str = str(value).strip().lower()
         
@@ -139,10 +141,10 @@ class DataTransformer:
             return "shopify"
         
         # Handle string values
-        if 'not tracked' in value_str or value_str == '':
+        if 'not tracked' in value_str:
             return "not tracked"
-        elif 'shopify' in value_str:
-            return "shopify"
+        elif 'shopify' in value_str or value_str == '':
+            return "shopify"  # Default empty to "shopify"
         else:
             # Default to shopify if we have any value
             return "shopify"
@@ -310,6 +312,7 @@ class DataTransformer:
     def _transform_html(self, value: Any) -> str:
         """
         Transform HTML content (clean and validate).
+        Converts literal \n to HTML line breaks and fixes formatting.
         
         Args:
             value: HTML content
@@ -322,8 +325,53 @@ class DataTransformer:
         
         html = str(value).strip()
         
+        # Convert literal \n (escaped newlines) to actual newlines
+        html = html.replace('\\n', '\n')
+        
+        # If the content already has HTML tags, preserve them but clean up newlines
+        if '<' in html and '>' in html:
+            # Has HTML tags - convert newlines between tags to proper spacing
+            # Replace newlines that are not inside tags with <br>
+            # Split by newlines and process each line
+            lines = html.split('\n')
+            cleaned_lines = []
+            for line in lines:
+                line = line.strip()
+                if line:
+                    # If line is already an HTML tag, keep it as is
+                    if line.startswith('<') and line.endswith('>'):
+                        cleaned_lines.append(line)
+                    # If line contains HTML tags, preserve them
+                    elif '<' in line and '>' in line:
+                        cleaned_lines.append(line)
+                    # Otherwise, wrap in paragraph or add <br>
+                    else:
+                        if cleaned_lines and not cleaned_lines[-1].endswith('>'):
+                            cleaned_lines.append('<br>')
+                        cleaned_lines.append(line)
+            
+            html = '\n'.join(cleaned_lines)
+            # Replace remaining standalone newlines with <br>
+            html = re.sub(r'\n(?!<)', '<br>\n', html)
+        else:
+            # Plain text - convert to proper HTML paragraphs
+            paragraphs = [p.strip() for p in html.split('\n') if p.strip()]
+            if paragraphs:
+                html = '<p>' + '</p>\n<p>'.join(paragraphs) + '</p>'
+            else:
+                html = html.replace('\n', '<br>')
+        
         # Basic HTML cleaning (remove script tags, etc.)
         html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Clean up multiple consecutive <br> tags (more than 2)
+        html = re.sub(r'(<br>\s*){3,}', '<br><br>', html, flags=re.IGNORECASE)
+        
+        # Clean up empty paragraphs
+        html = re.sub(r'<p>\s*</p>', '', html, flags=re.IGNORECASE)
+        
+        # Remove trailing <br> tags at the end
+        html = re.sub(r'<br>\s*$', '', html, flags=re.IGNORECASE | re.MULTILINE)
         
         return html
     

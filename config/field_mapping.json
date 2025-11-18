@@ -6,6 +6,7 @@
         "Name": "Title",
         "SKU": "SKU",
         "Description": "Description",
+        "Categories": "Product category",
         "Regular price": "Price",
         "Sale price": "Compare-at price",
         "Images": "Product image URL",

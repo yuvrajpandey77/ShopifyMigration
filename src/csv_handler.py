@@ -154,6 +154,8 @@ class CSVHandler:
                 encoding=encoding,
                 index=index,
                 lineterminator='\n',  # Use Unix line endings
+                quoting=1,  # QUOTE_ALL - quote all fields to preserve newlines in HTML
+                escapechar=None,  # Don't escape, use quoting instead
                 **kwargs
             )
             logger.info(f"Successfully wrote CSV file: {file_path}")

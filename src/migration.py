@@ -4,6 +4,7 @@ Coordinates the entire migration process.
 """
 
 import pandas as pd
+import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime
@@ -83,9 +84,74 @@ class MigrationOrchestrator:
         logger.info(f"Template has {len(template_df.columns)} columns: {list(template_df.columns)}")
         return template_df
     
+    def _extract_base_product_name(self, product_name: str) -> str:
+        """Extract base product name, removing variant suffixes like '- Small', '- Medium', etc."""
+        if pd.isna(product_name):
+            return ""
+        
+        name = str(product_name).strip()
+        # Remove common variant patterns: " - Small", " - Medium", " - Large", etc.
+        # Also handle patterns like "-Small", "-Small/Black", etc.
+        import re
+        # Remove size/color variants at the end
+        name = re.sub(r'\s*-\s*(Small|Medium|Large|XLarge|XSmall|XL|XXL|S|M|L|XS|XXS)(\s*/\s*[^,]+)?$', '', name, flags=re.IGNORECASE)
+        name = re.sub(r'\s*-\s*[A-Z][a-z]+(\s*/\s*[^,]+)?$', '', name)  # Remove other single-word variants
+        return name.strip()
+    
+    def _extract_variant_option(self, product_name: str, base_name: str, sku: str = None) -> str:
+        """Extract variant option value from product name or SKU."""
+        if pd.isna(product_name) or not base_name:
+            return ""
+        
+        name = str(product_name).strip()
+        base = str(base_name).strip()
+        
+        if name == base:
+            # If name is same as base, try to extract from SKU
+            if sku and pd.notna(sku):
+                sku_str = str(sku).strip()
+                # Extract size from SKU patterns like "Black/Black-Small" or "4-Pink"
+                # Look for size patterns at the end
+                size_match = re.search(r'[-/](Small|Medium|Large|XLarge|XSmall|XL|XXL|S|M|L|XS|XXS|XXS)$', sku_str, re.IGNORECASE)
+                if size_match:
+                    return size_match.group(1)
+                # If no size found, try to extract color or other variant
+                # Pattern: "Color-Size" or "Size-Color"
+                parts = re.split(r'[-/]', sku_str)
+                if len(parts) > 1:
+                    # Check if last part is a size
+                    last_part = parts[-1].strip()
+                    if last_part.lower() in ['small', 'medium', 'large', 'xlarge', 'xsmall', 'xl', 'xxl', 's', 'm', 'l', 'xs', 'xxs']:
+                        return last_part
+                    # Otherwise return the last part as variant
+                    return last_part
+                # If SKU is just a number (like "9"), use it as the variant option
+                if sku_str.isdigit():
+                    return sku_str
+            return ""  # Parent product, no variant
+        
+        # Extract variant part after base name
+        if name.startswith(base):
+            variant = name[len(base):].strip()
+            # Remove leading dash and spaces
+            variant = variant.lstrip('-').strip()
+            # Handle cases like "Small/Black" - take first part
+            if '/' in variant:
+                variant = variant.split('/')[0].strip()
+            # If variant is just a number (like "- 9"), extract it
+            if variant.isdigit():
+                return variant
+            # Extract number from variant like "- 9" or "-9"
+            num_match = re.search(r'[- ]?(\d+)$', variant)
+            if num_match:
+                return num_match.group(1)
+            return variant
+        
+        return ""
+    
     def migrate(self) -> Dict[str, Any]:
         """
-        Execute the complete migration process.
+        Execute the complete migration process with variant grouping.
         
         Returns:
             Migration statistics dictionary
@@ -108,162 +174,249 @@ class MigrationOrchestrator:
         required_fields = self.mapper.get_required_fields()
         self.validator.required_fields = required_fields
         
-        # Process each row
+        # Group products by base name for variant handling
+        logger.info("Grouping products by base name for variant handling...")
+        source_df['BaseName'] = source_df['Name'].apply(self._extract_base_product_name)
+        
+        # Process products grouped by base name
         shopify_rows = []
         errors = []
         
-        logger.info(f"Processing {len(source_df)} rows...")
+        logger.info(f"Processing {len(source_df)} rows, grouped into products...")
         
-        for idx, row in tqdm(source_df.iterrows(), total=len(source_df), desc="Migrating"):
-            row_number = idx + 2  # +2 because CSV rows start at 1, and header is row 1
-            
+        # Group by base name
+        grouped = source_df.groupby('BaseName')
+        
+        for base_name, group_df in tqdm(grouped, total=len(grouped), desc="Migrating"):
             try:
-                # Validate source row
-                source_row = row.to_dict()
-                is_valid_source, source_errors = self.validator.validate_source_row(source_row, row_number)
+                # Find parent product (Type='variable' or has no price/variant info)
+                parent_row = None
+                variants = []
                 
-                if not is_valid_source:
-                    errors.append({
-                        'row_number': row_number,
-                        'type': 'source_validation',
-                        'errors': source_errors,
-                        'row_data': source_row
-                    })
-                    self.stats['failed_rows'] += 1
+                for idx, row in group_df.iterrows():
+                    row_type = str(row.get('Type', '')).lower()
+                    has_price = pd.notna(row.get('Regular price')) and str(row.get('Regular price', '')).strip()
+                    
+                    # Parent is the one with Type='variable' and no price
+                    if row_type == 'variable' and not has_price:
+                        parent_row = row
+                    elif row_type == 'variation' and has_price:
+                        # Variants have Type='variation' and have prices
+                        variants.append((idx, row))
+                    elif not has_price and parent_row is None:
+                        # Fallback: if no parent found yet and this has no price, it might be parent
+                        parent_row = row
+                    else:
+                        # Everything else goes to variants
+                        variants.append((idx, row))
+                
+                # If no parent found, use first row as parent
+                if parent_row is None and len(group_df) > 0:
+                    parent_row = group_df.iloc[0]
+                    variants = [(idx, row) for idx, row in group_df.iterrows() if idx != parent_row.name]
+                
+                if parent_row is None:
                     continue
                 
-                # Map fields
-                mapped_row = self.mapper.map_row(source_row)
+                # Process parent product
+                parent_dict = parent_row.to_dict()
+                parent_dict['Name'] = base_name  # Use base name for parent
                 
-                # Generate URL handle from Title if not already set
-                if 'Title' in mapped_row and 'URL handle' not in mapped_row:
-                    mapped_row['URL handle'] = mapped_row['Title']
+                # Map parent fields
+                mapped_parent = self.mapper.map_row(parent_dict)
                 
-                # Handle missing price - use Sale price or set default
-                if 'Price' not in mapped_row or not mapped_row.get('Price') or pd.isna(mapped_row.get('Price')):
-                    # Try to use Sale price if available
-                    if 'Compare-at price' in mapped_row and mapped_row.get('Compare-at price'):
-                        mapped_row['Price'] = mapped_row['Compare-at price']
-                    else:
-                        # Skip products without prices (they will fail validation)
-                        pass
+                # Generate Handle from base name
+                if 'Title' in mapped_parent:
+                    mapped_parent['URL handle'] = mapped_parent['Title']
                 
-                # Transform data
-                transformed_row = self.transformer.transform_row(mapped_row)
+                # Transform parent
+                transformed_parent = self.transformer.transform_row(mapped_parent)
                 
-                # Skip products without Product image URL
-                product_image_url = transformed_row.get('Product image URL', '')
-                if not product_image_url or pd.isna(product_image_url) or str(product_image_url).strip() == '':
+                # Check for image on parent
+                parent_image = transformed_parent.get('Product image URL', '')
+                if not parent_image or pd.isna(parent_image) or str(parent_image).strip() == '':
+                    # Try to get image from variants
+                    for _, variant_row in variants:
+                        variant_dict = variant_row.to_dict()
+                        variant_mapped = self.mapper.map_row(variant_dict)
+                        variant_transformed = self.transformer.transform_row(variant_mapped)
+                        variant_image = variant_transformed.get('Product image URL', '')
+                        if variant_image and pd.notna(variant_image) and str(variant_image).strip():
+                            transformed_parent['Product image URL'] = variant_image
+                            break
+                
+                # Skip if still no image
+                if not transformed_parent.get('Product image URL') or pd.isna(transformed_parent.get('Product image URL')) or str(transformed_parent.get('Product image URL', '')).strip() == '':
                     errors.append({
-                        'row_number': row_number,
+                        'row_number': parent_row.name + 2,
                         'type': 'missing_image',
                         'errors': ['Missing Product image URL'],
-                        'warnings': [],
-                        'row_data': transformed_row
+                        'row_data': transformed_parent
                     })
-                    self.stats['failed_rows'] += 1
+                    self.stats['failed_rows'] += len(variants) + 1
                     continue
                 
-                # Validate transformed row
-                is_valid, validation_errors, validation_warnings = self.validator.validate_shopify_row(
-                    transformed_row,
-                    row_number,
-                    required_fields
-                )
+                # Get handle for variants
+                handle = transformed_parent.get('URL handle', '')
+                if not handle:
+                    handle = self.transformer._transform_handle(base_name) if base_name else ""
                 
-                if not is_valid:
-                    errors.append({
-                        'row_number': row_number,
-                        'type': 'validation',
-                        'errors': validation_errors,
-                        'warnings': validation_warnings,
-                        'row_data': transformed_row
-                    })
-                    self.stats['failed_rows'] += 1
-                    if not self._should_continue_on_error():
-                        break
-                    continue
-                
-                # Add warnings to stats
-                if validation_warnings:
-                    self.stats['warnings'].extend([
-                        {'row_number': row_number, 'warning': w} for w in validation_warnings
-                    ])
-                
-                # Handle duplicate SKUs by adding suffix (before ensuring all columns)
-                if 'SKU' in transformed_row and transformed_row['SKU']:
-                    sku = transformed_row['SKU']
-                    # Check if this SKU already exists in our output
-                    existing_skus = [row.get('SKU', '') for row in shopify_rows]
-                    if sku in existing_skus:
-                        # Add suffix to make it unique
-                        counter = 1
-                        new_sku = f"{sku}-{counter}"
-                        while new_sku in existing_skus:
-                            counter += 1
-                            new_sku = f"{sku}-{counter}"
-                        transformed_row['SKU'] = new_sku
-                        logger.warning(f"Row {row_number}: Duplicate SKU '{sku}' changed to '{new_sku}'")
-                
-                # Handle fulfillment service based on inventory tracker
-                # Shopify rule: 
-                # - If inventory tracker is "shopify", fulfillment service should be "manual"
-                # - If inventory tracker is "not tracked", fulfillment service must be empty (but Shopify may reject this)
-                # Default: Always use "shopify" + "manual" for compatibility
-                inventory_tracker = transformed_row.get('Inventory tracker', 'shopify')
-                if 'Fulfillment service' in shopify_columns:
-                    if inventory_tracker == 'not tracked' or inventory_tracker == '' or str(inventory_tracker).lower() == 'not tracked':
-                        # When inventory is not tracked, fulfillment service must be empty
-                        # But Shopify may reject this, so we'll set to empty only if explicitly needed
-                        transformed_row['Fulfillment service'] = ''
-                    else:
-                        # Default: If inventory is tracked (shopify), set to 'manual'
-                        transformed_row['Fulfillment service'] = 'manual'
-                
-                # Ensure fulfillment service is always set (default to 'manual' if empty)
-                if 'Fulfillment service' in shopify_columns:
-                    if not transformed_row.get('Fulfillment service') or transformed_row.get('Fulfillment service') == '':
-                        # If empty, default to 'manual' and set inventory tracker to 'shopify'
-                        transformed_row['Fulfillment service'] = 'manual'
-                        transformed_row['Inventory tracker'] = 'shopify'
-                
-                # Ensure "Continue selling when out of stock" is set correctly
-                # This is the "Inventory policy" - should be "deny" or "continue"
-                if 'Continue selling when out of stock' in shopify_columns:
-                    if 'Continue selling when out of stock' not in transformed_row or not transformed_row.get('Continue selling when out of stock'):
-                        transformed_row['Continue selling when out of stock'] = 'deny'
-                
-                # Ensure all Shopify columns are present (only add empty if truly missing)
+                # Create parent row (first row with full info)
+                parent_shopify_row = {}
                 for col in shopify_columns:
-                    if col not in transformed_row:
-                        transformed_row[col] = ""
-                    # Debug: Check if Description is being lost
-                    if col == 'Description' and transformed_row.get(col):
-                        # Description exists, make sure it's preserved
-                        pass
-                
-                # Reorder columns to match template (preserve all values)
-                ordered_row = {}
-                for col in shopify_columns:
-                    # Use get() with empty string default, but preserve actual values
-                    if col in transformed_row:
-                        ordered_row[col] = transformed_row[col]
+                    if col in transformed_parent:
+                        parent_shopify_row[col] = transformed_parent[col]
                     else:
-                        ordered_row[col] = ""
-                shopify_rows.append(ordered_row)
+                        parent_shopify_row[col] = ""
                 
+                # Parent product should NOT have Price, SKU, or variant-specific fields
+                # These cause Shopify to treat the parent as a "Default" variant with ₹0.00
+                # Clear ALL variant-related fields from parent
+                variant_fields = ['Price', 'Compare-at price', 'SKU', 'Variant SKU', 'Variant Price', 
+                                 'Variant Compare At Price', 'Variant Inventory Qty', 'Variant Inventory Tracker',
+                                 'Variant Inventory Policy', 'Variant Fulfillment Service', 'Variant Grams',
+                                 'Variant Requires Shipping', 'Variant Taxable', 'Variant Image']
+                for field in variant_fields:
+                    if field in parent_shopify_row:
+                        parent_shopify_row[field] = ""
+                
+                # Clean product category - Shopify requires exact taxonomy match
+                # Since we don't have Shopify's exact taxonomy, leave it empty to avoid errors
+                # User can set categories manually in Shopify after import
+                if 'Product category' in parent_shopify_row:
+                    # Leave category empty - Shopify will show warning but won't fail import
+                    # User can set correct categories in Shopify admin after import
+                    parent_shopify_row['Product category'] = ""
+                
+                # Set Type to empty or valid value (not "variable")
+                if 'Type' in parent_shopify_row:
+                    type_val = parent_shopify_row.get('Type', '')
+                    if pd.isna(type_val) or str(type_val).lower() == 'variable' or str(type_val).lower() == 'nan':
+                        parent_shopify_row['Type'] = ""  # Empty for parent with variants
+                
+                # Set Option1 Name if we have variants (but don't set Option1 Value for parent)
+                # IMPORTANT: Only set Option1 Name if we actually have variants to prevent default variant
+                if variants and len(variants) > 0:
+                    parent_shopify_row['Option1 name'] = 'Size'  # Default, can be improved
+                else:
+                    # No variants, so don't set Option1 Name (prevents default variant)
+                    if 'Option1 name' in parent_shopify_row:
+                        parent_shopify_row['Option1 name'] = ""
+                # Parent should NOT have Option1 Value (that's only for variants)
+                if 'Option1 value' in parent_shopify_row:
+                    parent_shopify_row['Option1 value'] = ""
+                
+                shopify_rows.append(parent_shopify_row)
                 self.stats['successful_rows'] += 1
-                self.stats['processed_rows'] += 1
+                
+                # Process variants
+                # Get parent image to copy to variants if they don't have one
+                parent_image = transformed_parent.get('Product image URL', '')
+                
+                for variant_idx, variant_row in variants:
+                    variant_dict = variant_row.to_dict()
+                    
+                    # Skip if this is actually the parent product (Type='variable' and no price)
+                    variant_type = str(variant_row.get('Type', '')).lower()
+                    variant_has_price = pd.notna(variant_row.get('Regular price')) and str(variant_row.get('Regular price', '')).strip()
+                    
+                    if variant_type == 'variable' and not variant_has_price:
+                        continue  # Skip parent product, don't create a "Default" variant
+                    
+                    # Map variant fields
+                    mapped_variant = self.mapper.map_row(variant_dict)
+                    
+                    # Transform variant
+                    transformed_variant = self.transformer.transform_row(mapped_variant)
+                    
+                    # Copy parent image to variant if variant doesn't have one
+                    variant_image = transformed_variant.get('Product image URL', '')
+                    if (not variant_image or pd.isna(variant_image) or str(variant_image).strip() == '') and parent_image:
+                        transformed_variant['Product image URL'] = parent_image
+                    
+                    # Extract variant option value (try from name first, then SKU)
+                    variant_option = self._extract_variant_option(
+                        str(variant_row.get('Name', '')),
+                        base_name,
+                        sku=str(variant_row.get('SKU', ''))
+                    )
+                    
+                    # Create variant row (Title empty, same Handle, Option values, Variant Price)
+                    variant_shopify_row = {}
+                    for col in shopify_columns:
+                        if col == 'Title':
+                            variant_shopify_row[col] = ""  # Empty for variants
+                        elif col == 'URL handle':
+                            variant_shopify_row[col] = handle  # Same handle
+                        elif col == 'Option1 value':
+                            variant_shopify_row[col] = variant_option if variant_option else ""
+                        elif col == 'Option1 name':
+                            variant_shopify_row[col] = 'Size' if variant_option else ""
+                        elif col in transformed_variant:
+                            variant_shopify_row[col] = transformed_variant[col]
+                        else:
+                            variant_shopify_row[col] = ""
+                    
+                    # Handle inventory AFTER creating the row to override transformer's default
+                    # Check source data directly
+                    source_stock = variant_row.get('Stock', '')
+                    in_stock = variant_row.get('In stock?', 0)
+                    
+                    # Convert in_stock to comparable value (handle both int and string)
+                    in_stock_val = int(in_stock) if pd.notna(in_stock) else 0
+                    if isinstance(in_stock, str):
+                        in_stock_val = 1 if in_stock.strip() == '1' else 0
+                    
+                    # Find the inventory quantity column in shopify_columns (before mapping)
+                    inventory_col = None
+                    for col in shopify_columns:
+                        if 'Inventory quantity' in col or ('Inventory' in col and 'quantity' in col.lower()):
+                            inventory_col = col
+                            break
+                    
+                    if inventory_col and inventory_col in variant_shopify_row:
+                        # Use actual Stock value from source data, or default to 100
+                        if pd.notna(source_stock) and str(source_stock).strip() != '':
+                            try:
+                                stock_val = float(source_stock)
+                                # Use actual stock value (even if 0)
+                                variant_shopify_row[inventory_col] = str(int(stock_val))
+                            except:
+                                variant_shopify_row[inventory_col] = str(source_stock).strip()
+                        else:
+                            # No stock value in source - set default to 100
+                            variant_shopify_row[inventory_col] = "100"
+                        
+                        # CRITICAL: When inventory quantity is set, ensure inventory tracker is "shopify"
+                        # Find inventory tracker column
+                        tracker_col = None
+                        for col in shopify_columns:
+                            if 'Inventory tracker' in col or ('Inventory' in col and 'tracker' in col.lower()):
+                                tracker_col = col
+                                break
+                        
+                        if tracker_col and tracker_col in variant_shopify_row:
+                            # Set to "shopify" to track inventory
+                            variant_shopify_row[tracker_col] = "shopify"
+                    
+                    # Ensure variant has price - skip if no price
+                    if not variant_shopify_row.get('Price') or pd.isna(variant_shopify_row.get('Price')) or str(variant_shopify_row.get('Price', '')).strip() == '':
+                        continue  # Skip variants without price
+                    
+                    shopify_rows.append(variant_shopify_row)
+                    self.stats['successful_rows'] += 1
+                
+                self.stats['processed_rows'] += len(group_df)
                 
             except Exception as e:
-                logger.error(f"Error processing row {row_number}: {e}")
+                logger.error(f"Error processing product group '{base_name}': {e}")
                 errors.append({
-                    'row_number': row_number,
+                    'row_number': 'group',
                     'type': 'processing_error',
                     'error': str(e),
-                    'row_data': source_row if 'source_row' in locals() else {}
+                    'row_data': {'base_name': base_name}
                 })
-                self.stats['failed_rows'] += 1
+                self.stats['failed_rows'] += len(group_df)
                 if not self._should_continue_on_error():
                     break
         
@@ -306,10 +459,46 @@ class MigrationOrchestrator:
                 shopify_df = shopify_df.rename(columns=rename_dict)
                 logger.info(f"Renamed {len(rename_dict)} columns to Shopify standard format")
             
+            # After column mapping, ensure parent rows don't have variant-specific fields
+            # This prevents Shopify from creating "Default" variants with ₹0.00
+            variant_field_names = [
+                'Variant SKU', 'Variant Price', 'Variant Compare At Price', 
+                'Variant Inventory Qty', 'Variant Inventory Tracker', 'Variant Inventory Policy',
+                'Variant Fulfillment Service', 'Variant Grams', 'Variant Requires Shipping',
+                'Variant Taxable', 'Variant Image', 'Variant Barcode',
+                'Option1 Value', 'Option2 Value', 'Option3 Value',
+                'Option1 Name', 'Option2 Name', 'Option3 Name'
+            ]
+            
+            for idx, row in shopify_df.iterrows():
+                # Check if this is a parent row (has Title)
+                if pd.notna(row.get('Title')) and str(row.get('Title', '')).strip() != '':
+                    # Clear ALL variant-specific fields from parent
+                    for field in variant_field_names:
+                        if field in shopify_df.columns:
+                            shopify_df.at[idx, field] = ""
+            
+            # Replace any remaining NaN values with empty strings before writing
+            shopify_df = shopify_df.fillna('')
+            shopify_df = shopify_df.replace('nan', '')
+            
+            # Ensure all variants with inventory quantity have inventory tracker set to "shopify"
+            if 'Variant Inventory Qty' in shopify_df.columns and 'Variant Inventory Tracker' in shopify_df.columns:
+                for idx, row in shopify_df.iterrows():
+                    # Only process variants (rows without Title)
+                    if pd.isna(row.get('Title')) or str(row.get('Title', '')).strip() == '':
+                        inventory_qty = row.get('Variant Inventory Qty', '')
+                        inventory_tracker = row.get('Variant Inventory Tracker', '')
+                        
+                        # If inventory quantity is set (not empty), ensure tracker is "shopify"
+                        if inventory_qty and str(inventory_qty).strip() != '' and str(inventory_qty).strip() != 'nan':
+                            if not inventory_tracker or str(inventory_tracker).strip().lower() != 'shopify':
+                                shopify_df.at[idx, 'Variant Inventory Tracker'] = "shopify"
+            
             # Shopify only accepts specific columns - remove columns that Shopify doesn't recognize
             # Keep only the columns that Shopify actually accepts
             shopify_accepted_columns = [
-                'Handle', 'Title', 'Body (HTML)', 'Vendor', 'Type', 'Tags', 'Published',
+                'Handle', 'Title', 'Body (HTML)', 'Vendor', 'Product category', 'Type', 'Tags', 'Published',
                 'Option1 Name', 'Option1 Value', 'Option2 Name', 'Option2 Value',
                 'Option3 Name', 'Option3 Value', 'Variant SKU', 'Variant Grams',
                 'Variant Inventory Tracker', 'Variant Inventory Qty', 'Variant Inventory Policy',
