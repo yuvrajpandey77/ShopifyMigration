@@ -62,6 +62,44 @@ class FieldMapper:
                 if pd.notna(value):  # Check for NaN/None
                     shopify_row[shopify_field] = str(value).strip()
         
+        # CRITICAL: Ensure Description field is populated from any available source
+        # Check Description, Short description, and Meta: rank_math_description
+        description_parts = []
+        
+        # Check Description field
+        if 'Description' in source_row:
+            desc = source_row['Description']
+            if pd.notna(desc) and str(desc).strip() != '' and str(desc).strip().lower() != 'nan':
+                description_parts.append(str(desc).strip())
+        
+        # Check Short description field
+        if 'Short description' in source_row:
+            short_desc = source_row['Short description']
+            if pd.notna(short_desc) and str(short_desc).strip() != '' and str(short_desc).strip().lower() != 'nan':
+                description_parts.append(str(short_desc).strip())
+        
+        # Check Meta: rank_math_description as fallback
+        if 'Meta: rank_math_description' in source_row and len(description_parts) == 0:
+            meta_desc = source_row['Meta: rank_math_description']
+            if pd.notna(meta_desc) and str(meta_desc).strip() != '' and str(meta_desc).strip().lower() != 'nan':
+                description_parts.append(str(meta_desc).strip())
+        
+        # Combine all description parts and set to Description field
+        if description_parts:
+            combined_description = '\n\n'.join(description_parts)
+            # Find the target field for Description
+            desc_target = None
+            for source_field, shopify_field in direct_mappings.items():
+                if source_field == 'Description' or shopify_field in ['Description', 'Body (HTML)']:
+                    desc_target = shopify_field
+                    break
+            
+            if desc_target:
+                shopify_row[desc_target] = combined_description
+            else:
+                # Description not in direct mappings, add it directly
+                shopify_row['Description'] = combined_description
+        
         # Apply concatenation mappings
         concat_mappings = self.mapping_config.get('mappings', {}).get('concatenate', {}).get('fields', {})
         for mapping in concat_mappings.values():

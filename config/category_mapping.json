@@ -1,0 +1,36 @@
+{
+  "category_mappings": {
+    "comment": "Map source categories to Shopify's Standard Product Taxonomy - Using verified valid top-level categories only",
+    "mappings": {
+      "Roller Skates": "Sporting Goods",
+      "Roller Skates > Antik Skates": "Sporting Goods",
+      "Roller Skates > Antik Skates > Antik Boots": "Sporting Goods",
+      "Roller Skates > Antik Skates > Antik Skates Packages": "Sporting Goods",
+      "Roller Skates > Atom Quad": "Sporting Goods",
+      "Roller Skates > Atom Quad - Roller Skate": "Sporting Goods",
+      "Roller Skates > Roller Skate Plates": "Sporting Goods",
+      "Roller Skates > Roller Skate Wheels": "Sporting Goods",
+      "Roller Skates > Roller Skate Bearings": "Sporting Goods",
+      "Roller Skates > Roller Skate Accessories": "Sporting Goods",
+      "Roller Skates > Chicago Skates": "Sporting Goods",
+      "Roller Skates > Roller Skates for Kids": "Sporting Goods",
+      "Roller Skates > Roller Outdoor Skate": "Sporting Goods",
+      "Roller Skates > Roller Speed Skate": "Sporting Goods",
+      "Skate Protective Gear": "Sporting Goods",
+      "Skate Protective Gear > 187 Killer Pads": "Sporting Goods",
+      "Skate Protective Gear > Roller Skate Accessories": "Sporting Goods",
+      "Inline Speed Skates": "Sporting Goods",
+      "Inline Speed Skates > Inline Skate Package": "Sporting Goods",
+      "Inline Speed Skates > Inline Skates Luigino": "Sporting Goods",
+      "Inline Speed Skates > Inline Skates Luigino > Luigino Skate Package": "Sporting Goods",
+      "Inline Speed Skates > Inline Skate Package > Luigino Skate": "Sporting Goods",
+      "Inline Speed Skates > Inline Speed Skate for Kids": "Sporting Goods",
+      "Inline Speed Skates > Inline Skate Wheels": "Sporting Goods",
+      "Inline Speed Skates > Inline Skate Bearings": "Sporting Goods",
+      "Inline Speed Skates > Inline Skate Accessories": "Sporting Goods"
+    },
+    "fallback_strategy": "default",
+    "comment_fallback": "Options: 'clear' (set to empty), 'default' (use default_category), 'warn' (keep original but log warning)",
+    "default_category": "Sporting Goods"
+  }
+}
