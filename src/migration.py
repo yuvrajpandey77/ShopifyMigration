@@ -7,6 +7,7 @@ import pandas as pd
 import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from loguru import logger
 from tqdm import tqdm
@@ -17,6 +18,118 @@ from .transformer import DataTransformer
 from .validator import DataValidator
 
 
+def normalize_product_name(product_name: str) -> str:
+    """
+    Normalize product name by stripping variant suffixes (size, color, numeric).
+    This helper is shared between migration logic and batch splitting to ensure consistency.
+    """
+    if pd.isna(product_name):
+        return ""
+    
+    name = str(product_name).strip()
+    colors = [
+        'Black', 'White', 'Red', 'Blue', 'Green', 'Yellow', 'Orange', 'Pink', 'Purple',
+        'Brown', 'Grey', 'Gray', 'Silver', 'Gold', 'Navy', 'Teal', 'Cyan', 'Magenta',
+        'Beige', 'Tan', 'Maroon', 'Olive', 'Lime', 'Aqua', 'Coral', 'Salmon', 'Khaki',
+        'Burgundy', 'Charcoal', 'Cream', 'Ivory', 'Mint', 'Peach', 'Turquoise', 'Violet',
+        'Amber', 'Bronze', 'Copper', 'Indigo', 'Lavender', 'Mauve', 'Mustard', 'Plum',
+        'Rose', 'Ruby', 'Sage', 'Scarlet', 'Taupe', 'Wine', 'Azure', 'Champagne'
+    ]
+    
+    sizes = [
+        'Small', 'Medium', 'Large', 'XLarge', 'XSmall', 'XL', 'XXL', 'S', 'M', 'L', 'XS', 'XXS',
+        'Extra Small', 'Extra Large', '2XL', '3XL', '4XL', '5XL', 'XXXL', 'XXXXL',
+        'Petite', 'Regular', 'Tall', 'Short', 'Plus', 'Oversized'
+    ]
+    
+    size_pattern = r'\s*[-(\s]*(' + '|'.join(re.escape(s) for s in sizes) + r')(\s*[/)]\s*[^,]+)?\s*[)\s]*$'
+    color_pattern = r'\s*[-(\s]*(' + '|'.join(re.escape(c) for c in colors) + r')(\s*[/)]\s*[^,]+)?\s*[)\s]*$'
+    number_pattern = r'\s*[-(\s]*(\d+\.?\d*)\s*[)\s]*$'
+    size_color_pattern = r'\s*-\s*(' + '|'.join(re.escape(s) for s in sizes) + r')\s*/\s*(' + '|'.join(re.escape(c) for c in colors) + r')\s*$'
+    color_size_pattern = r'\s*-\s*(' + '|'.join(re.escape(c) for c in colors) + r')\s*/\s*(' + '|'.join(re.escape(s) for s in sizes) + r')\s*$'
+    word_pattern = r'\s*-\s*[A-Z][a-z]+(\s*/\s*[A-Z][a-z]+)?\s*$'
+    paren_pattern = r'\s*\([^)]+\)\s*$'
+    
+    previous = None
+    while previous != name:
+        previous = name
+        name = re.sub(size_pattern, '', name, flags=re.IGNORECASE)
+        name = re.sub(color_pattern, '', name, flags=re.IGNORECASE)
+        name = re.sub(number_pattern, '', name)
+        name = re.sub(size_color_pattern, '', name, flags=re.IGNORECASE)
+        name = re.sub(color_size_pattern, '', name, flags=re.IGNORECASE)
+        name = re.sub(word_pattern, '', name)
+        name = re.sub(paren_pattern, '', name)
+    
+    name = name.strip().rstrip('-').strip().rstrip('(').strip()
+    return name
+
+
+def determine_product_group_id(row: pd.Series) -> str:
+    """
+    Determine a stable product group identifier using parent slug when available,
+    otherwise falling back to normalized product name/SKU.
+    """
+    if row is None:
+        return ""
+    
+    parent_value = row.get('Parent')
+    if parent_value is not None:
+        parent_str = str(parent_value).strip()
+        if parent_str and parent_str.lower() not in ['nan', 'none', '0']:
+            return parent_str
+    
+    row_type = str(row.get('Type', '')).strip().lower()
+    sku_value = row.get('SKU', '')
+    if sku_value is not None:
+        sku_str = str(sku_value).strip()
+    else:
+        sku_str = ''
+    
+    if row_type == 'variation':
+        # Variants without parent fallback to SKU
+        if sku_str and sku_str.lower() not in ['nan', 'none']:
+            return sku_str
+    
+    if row_type in ['variable', 'simple', 'grouped'] and sku_str and sku_str.lower() not in ['nan', 'none']:
+        return sku_str
+    
+    base_name = normalize_product_name(row.get('Name', ''))
+    if base_name:
+        return base_name
+    
+    name = row.get('Name', '')
+    if pd.notna(name):
+        return str(name).strip()
+    
+    return ""
+
+
+def clean_price_value(value: Any) -> Optional[str]:
+    """
+    Normalize a price value from the source row to a Shopify-compatible string.
+    Returns None if value is missing, non-numeric, or <= 0.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    
+    value_str = str(value).strip()
+    if not value_str or value_str.lower() in ['nan', 'none', 'null', 'backorder', 'backordered']:
+        return None
+    
+    cleaned = value_str.replace('$', '').replace(',', '').replace('₹', '').strip()
+    if not cleaned:
+        return None
+    
+    try:
+        price_decimal = Decimal(cleaned)
+    except InvalidOperation:
+        return None
+    
+    if price_decimal <= 0:
+        return None
+    
+    return f"{price_decimal.quantize(Decimal('0.01'))}"
 class MigrationOrchestrator:
     """Orchestrate the complete migration process."""
     
@@ -78,6 +191,27 @@ class MigrationOrchestrator:
             'warnings': []
         }
     
+    def _extract_source_price(self, row: pd.Series) -> Optional[str]:
+        """
+        Extract the best available price from the source row.
+        Prefers sale price over regular price, then other known price fields.
+        """
+        price_fields = [
+            'Sale price',
+            'Regular price',
+            'Price',
+            'Meta: _sale_price',
+            'Meta: _regular_price',
+            'Meta: _price'
+        ]
+        
+        for field in price_fields:
+            if field in row:
+                price = clean_price_value(row.get(field))
+                if price:
+                    return price
+        return None
+    
     def analyze_source(self) -> Dict[str, Any]:
         """
         Analyze the source CSV file.
@@ -108,57 +242,7 @@ class MigrationOrchestrator:
         This ensures products with same base name but different colors/sizes are grouped together.
         IMPROVED: Better detection of color and size variants.
         """
-        if pd.isna(product_name):
-            return ""
-        
-        name = str(product_name).strip()
-        import re
-        
-        # Extended color list (common colors)
-        colors = [
-            'Black', 'White', 'Red', 'Blue', 'Green', 'Yellow', 'Orange', 'Pink', 'Purple',
-            'Brown', 'Grey', 'Gray', 'Silver', 'Gold', 'Navy', 'Teal', 'Cyan', 'Magenta',
-            'Beige', 'Tan', 'Maroon', 'Olive', 'Lime', 'Aqua', 'Coral', 'Salmon', 'Khaki',
-            'Burgundy', 'Charcoal', 'Cream', 'Ivory', 'Mint', 'Peach', 'Turquoise', 'Violet',
-            'Amber', 'Bronze', 'Copper', 'Indigo', 'Lavender', 'Mauve', 'Mustard', 'Plum',
-            'Rose', 'Ruby', 'Sage', 'Scarlet', 'Taupe', 'Wine', 'Azure', 'Champagne'
-        ]
-        
-        # Extended size list
-        sizes = [
-            'Small', 'Medium', 'Large', 'XLarge', 'XSmall', 'XL', 'XXL', 'S', 'M', 'L', 'XS', 'XXS',
-            'Extra Small', 'Extra Large', '2XL', '3XL', '4XL', '5XL', 'XXXL', 'XXXXL',
-            'Petite', 'Regular', 'Tall', 'Short', 'Plus', 'Oversized'
-        ]
-        
-        # Pattern 1: Remove size variants at the end (with or without dash)
-        # Matches: " - Small", "-Small", " Small", " (Small)", etc.
-        size_pattern = r'\s*[-(\s]*(' + '|'.join(re.escape(s) for s in sizes) + r')(\s*[/)]\s*[^,]+)?\s*[)\s]*$'
-        name = re.sub(size_pattern, '', name, flags=re.IGNORECASE)
-        
-        # Pattern 2: Remove color variants at the end (with or without dash)
-        # Matches: " - Black", "-Black", " Black", " (Black)", etc.
-        color_pattern = r'\s*[-(\s]*(' + '|'.join(re.escape(c) for c in colors) + r')(\s*[/)]\s*[^,]+)?\s*[)\s]*$'
-        name = re.sub(color_pattern, '', name, flags=re.IGNORECASE)
-        
-        # Pattern 3: Remove numeric size variants: " - 10", " - 10.5", "-10", " (10)", etc.
-        name = re.sub(r'\s*[-(\s]*(\d+\.?\d*)\s*[)\s]*$', '', name)
-        
-        # Pattern 4: Remove size/color combinations: " - Small/Black", "-Black/Small", etc.
-        name = re.sub(r'\s*-\s*(' + '|'.join(re.escape(s) for s in sizes) + r')\s*/\s*(' + '|'.join(re.escape(c) for c in colors) + r')\s*$', '', name, flags=re.IGNORECASE)
-        name = re.sub(r'\s*-\s*(' + '|'.join(re.escape(c) for c in colors) + r')\s*/\s*(' + '|'.join(re.escape(s) for s in sizes) + r')\s*$', '', name, flags=re.IGNORECASE)
-        
-        # Pattern 5: Remove any remaining single-word variants after dash: " - Word" or "-Word"
-        # But be careful not to remove important product name parts
-        name = re.sub(r'\s*-\s*[A-Z][a-z]+(\s*/\s*[A-Z][a-z]+)?\s*$', '', name)
-        
-        # Pattern 6: Remove patterns like "Product Name (Color)" or "Product Name (Size)"
-        name = re.sub(r'\s*\([^)]+\)\s*$', '', name)
-        
-        # Remove trailing spaces, dashes, and parentheses
-        name = name.strip().rstrip('-').strip().rstrip('(').strip()
-        
-        return name
+        return normalize_product_name(product_name)
     
     def _extract_variant_option(self, product_name: str, base_name: str, sku: str = None) -> str:
         """
@@ -285,8 +369,9 @@ class MigrationOrchestrator:
         self.validator.required_fields = required_fields
         
         # Group products by base name for variant handling
-        logger.info("Grouping products by base name for variant handling...")
-        source_df['BaseName'] = source_df['Name'].apply(self._extract_base_product_name)
+        logger.info("Grouping products by base name/parent for variant handling...")
+        source_df['BaseName'] = source_df['Name'].apply(normalize_product_name)
+        source_df['ProductGroupID'] = source_df.apply(determine_product_group_id, axis=1)
         
         # Process products grouped by base name
         shopify_rows = []
@@ -296,10 +381,16 @@ class MigrationOrchestrator:
         
         # Group by base name - CRITICAL: Products with same base name MUST be grouped together
         # Even if they have identical names, they should be variants if they have different SKUs or other attributes
-        grouped = source_df.groupby('BaseName')
+        grouped = source_df.groupby('ProductGroupID')
         
-        for base_name, group_df in tqdm(grouped, total=len(grouped), desc="Migrating"):
+        for group_id, group_df in tqdm(grouped, total=len(grouped), desc="Migrating"):
             try:
+                base_name = ""
+                if 'BaseName' in group_df.columns:
+                    base_name = str(group_df['BaseName'].iloc[0]).strip()
+                if not base_name:
+                    base_name = str(group_id).strip() if group_id else str(group_df['Name'].iloc[0])
+                
                 # CRITICAL FIX: If multiple rows have the same exact Name (not just base name),
                 # they MUST be variants of the same product, not separate products
                 # Find parent product (Type='variable' or has no price/variant info)
@@ -342,11 +433,9 @@ class MigrationOrchestrator:
                     
                     # If only one row, it's a single product (no variants)
                     if len(group_df) == 1:
+                        # Single row = single product
+                        parent_row = group_df.iloc[0]
                         variants = []
-                else:
-                    # Single row = single product
-                    parent_row = group_df.iloc[0]
-                    variants = []
                 
                 if parent_row is None:
                     continue
@@ -354,6 +443,23 @@ class MigrationOrchestrator:
                 # Process parent product
                 parent_dict = parent_row.to_dict()
                 parent_dict['Name'] = base_name  # Use base name for parent
+                
+                # CRITICAL: Ensure parent has images - preserve from source row
+                # Check if parent row has Images field and preserve it
+                parent_images_source = parent_row.get('Images', '')
+                # Also check all rows in group for images (in case parent row doesn't have it)
+                if not parent_images_source or pd.isna(parent_images_source) or str(parent_images_source).strip() == '' or str(parent_images_source).strip().lower() == 'nan':
+                    # Try to get images from any row in the group
+                    for _, check_row in group_df.iterrows():
+                        check_images = check_row.get('Images', '')
+                        if check_images and pd.notna(check_images) and str(check_images).strip() != '' and str(check_images).strip().lower() != 'nan':
+                            parent_images_source = str(check_images).strip()
+                            break
+                
+                if parent_images_source and pd.notna(parent_images_source) and str(parent_images_source).strip() != '' and str(parent_images_source).strip().lower() != 'nan':
+                    # Ensure Images field is in parent_dict (it should be from to_dict(), but make sure)
+                    parent_dict['Images'] = str(parent_images_source).strip()
+                    logger.debug(f"Preserved images for parent: {base_name} - {str(parent_images_source)[:50]}...")
                 
                 # CRITICAL: Ensure parent has description - check Description and Short description
                 # If parent doesn't have description, try to get it from variants
@@ -375,6 +481,13 @@ class MigrationOrchestrator:
                 # Map parent fields
                 mapped_parent = self.mapper.map_row(parent_dict)
                 
+                # CRITICAL: Double-check that images were mapped - if not, add them directly
+                if 'Product image URL' not in mapped_parent or not mapped_parent.get('Product image URL') or pd.isna(mapped_parent.get('Product image URL')):
+                    # Images weren't mapped, add them directly
+                    if parent_images_source and pd.notna(parent_images_source) and str(parent_images_source).strip() != '' and str(parent_images_source).strip().lower() != 'nan':
+                        mapped_parent['Product image URL'] = str(parent_images_source).strip()
+                        logger.debug(f"Directly added images to parent product: {base_name}")
+                
                 # Generate Handle from base name
                 if 'Title' in mapped_parent:
                     mapped_parent['URL handle'] = mapped_parent['Title']
@@ -384,15 +497,25 @@ class MigrationOrchestrator:
                 
                 # Check for image on parent - handle multiple images
                 parent_image_str = transformed_parent.get('Product image URL', '')
-                if not parent_image_str or pd.isna(parent_image_str) or str(parent_image_str).strip() == '':
-                    # Try to get image from variants
+                
+                # CRITICAL: If images were lost during transformation, restore them from source
+                if not parent_image_str or pd.isna(parent_image_str) or str(parent_image_str).strip() == '' or str(parent_image_str).strip().lower() == 'nan':
+                    # Try to restore from parent_images_source (we saved it earlier)
+                    if parent_images_source and pd.notna(parent_images_source) and str(parent_images_source).strip() != '' and str(parent_images_source).strip().lower() != 'nan':
+                        parent_image_str = str(parent_images_source).strip()
+                        transformed_parent['Product image URL'] = parent_image_str
+                        logger.debug(f"Restored images after transformation for: {base_name}")
+                
+                # If still no image, try to get from variants
+                if not parent_image_str or pd.isna(parent_image_str) or str(parent_image_str).strip() == '' or str(parent_image_str).strip().lower() == 'nan':
                     for _, variant_row in variants:
                         variant_dict = variant_row.to_dict()
                         variant_mapped = self.mapper.map_row(variant_dict)
                         variant_transformed = self.transformer.transform_row(variant_mapped)
                         variant_image = variant_transformed.get('Product image URL', '')
-                        if variant_image and pd.notna(variant_image) and str(variant_image).strip():
+                        if variant_image and pd.notna(variant_image) and str(variant_image).strip() and str(variant_image).strip().lower() != 'nan':
                             parent_image_str = variant_image
+                            transformed_parent['Product image URL'] = parent_image_str
                             break
                 
                 # Parse multiple images (comma-separated)
@@ -402,13 +525,30 @@ class MigrationOrchestrator:
                     image_urls = [url.strip() for url in str(parent_image_str).split(',') if url.strip()]
                     parent_images = [url for url in image_urls if url and url != 'nan']
                 
-                # Skip if still no image
+                # FIX: If parent has no image, try to get from variants (don't skip entire product group)
                 if not parent_images:
+                    # Try to get image from variants
+                    for _, variant_row in variants:
+                        variant_dict = variant_row.to_dict()
+                        variant_mapped = self.mapper.map_row(variant_dict)
+                        variant_transformed = self.transformer.transform_row(variant_mapped)
+                        variant_image = variant_transformed.get('Product image URL', '')
+                        if variant_image and pd.notna(variant_image) and str(variant_image).strip() != '':
+                            # Split by comma and clean up
+                            image_urls = [url.strip() for url in str(variant_image).split(',') if url.strip()]
+                            parent_images = [url for url in image_urls if url and url != 'nan']
+                            if parent_images:
+                                logger.info(f"Using variant image for parent product: {base_name}")
+                                break
+                
+                # CRITICAL: Skip products without images
+                if not parent_images:
+                    logger.warning(f"Skipping product {base_name} - no images found in parent or variants")
                     errors.append({
                         'row_number': parent_row.name + 2,
                         'type': 'missing_image',
                         'errors': ['Missing Product image URL'],
-                        'row_data': transformed_parent
+                        'row_data': {'base_name': base_name}
                     })
                     self.stats['failed_rows'] += len(variants) + 1
                     continue
@@ -444,6 +584,7 @@ class MigrationOrchestrator:
                             else:
                                 parent_shopify_row[col] = ""
                         else:
+                            # For other columns not in transformed_parent, set empty
                             parent_shopify_row[col] = ""
                 
                 # CRITICAL: Ensure Description/Body (HTML) is set - if still empty, try to get from variants
@@ -489,9 +630,28 @@ class MigrationOrchestrator:
                                     parent_shopify_row[desc_col] = str(temp_desc).strip()
                                     break
                 
-                # Set first image for parent row
-                if 'Product image URL' in parent_shopify_row:
-                    parent_shopify_row['Product image URL'] = parent_images[0]
+                # If description is still empty, leave it empty (no default text)
+                # Description will remain blank if not found in source
+                
+                # Set first image for parent row (if available)
+                # CRITICAL: Ensure Product image URL column exists in parent_shopify_row
+                # Check both 'Product image URL' and 'Image Src' (template might use either)
+                image_col = None
+                for col in ['Product image URL', 'Image Src']:
+                    if col in shopify_columns:
+                        image_col = col
+                        break
+                
+                # If column not found in shopify_columns, add it anyway (Shopify needs it)
+                if not image_col:
+                    image_col = 'Product image URL'
+                
+                # Set the image value
+                if parent_images:
+                    parent_shopify_row[image_col] = parent_images[0]
+                    logger.debug(f"Set image for {base_name}: {parent_images[0][:50]}...")
+                else:
+                    parent_shopify_row[image_col] = ""  # Allow products without images
                 
                 # CRITICAL: Ensure ALL products have a category (use default if no mapping found)
                 # Categories are mapped from source "Categories" field to "Product category"
@@ -530,38 +690,26 @@ class MigrationOrchestrator:
                     # This is a SINGLE PRODUCT (no variants)
                     # For single products, Shopify needs variant fields populated
                     
-                    # Get price from SOURCE row (before transformation) - most reliable
-                    parent_price_raw = parent_row.get('Regular price', '')
-                    if not parent_price_raw or pd.isna(parent_price_raw) or str(parent_price_raw).strip() == '':
-                        # Try alternative price fields
-                        parent_price_raw = parent_row.get('Price', '') or parent_row.get('Sale price', '')
+                    parent_price = self._extract_source_price(parent_row)
                     
-                    # If still not found, try from transformed data
-                    if (not parent_price_raw or pd.isna(parent_price_raw) or str(parent_price_raw).strip() == ''):
-                        parent_price_raw = transformed_parent.get('Price', '') or transformed_parent.get('Regular price', '')
+                    # CRITICAL: Skip single products with zero or missing prices
+                    if not parent_price:
+                        logger.warning(f"Skipping single product {base_name} - no price in source data")
+                        errors.append({
+                            'row_number': parent_row.name + 2,
+                            'type': 'missing_price',
+                            'errors': ['Missing price for single product'],
+                            'row_data': {'base_name': base_name}
+                        })
+                        self.stats['failed_rows'] += 1
+                        continue
                     
-                    # If parent has no price, this might be an error - log it but continue
-                    if not parent_price_raw or pd.isna(parent_price_raw) or str(parent_price_raw).strip() == '':
-                        logger.warning(f"Single product {base_name} has no price in source data - skipping price setting")
-                    else:
-                        try:
-                            # Transform price to ensure proper format
-                            price_str = str(parent_price_raw).strip()
-                            price_str = price_str.replace('₹', '').replace(',', '').strip()
-                            price_val = float(price_str)
-                            if price_val > 0:
-                                formatted_price = f"{price_val:.2f}"
-                                # Set price in Variant Price field for single products
-                                # Use the column names that will exist after mapping
-                                if 'Price' in parent_shopify_row:
-                                    parent_shopify_row['Price'] = formatted_price
-                                if 'Variant Price' in parent_shopify_row:
-                                    parent_shopify_row['Variant Price'] = formatted_price
-                                logger.debug(f"Set price {formatted_price} for single product {base_name}")
-                            else:
-                                logger.warning(f"Single product {base_name} has zero price: {price_val}")
-                        except Exception as e:
-                            logger.warning(f"Could not set price for single product {base_name}: {e}, raw value: {parent_price_raw}")
+                    # Set price in Variant Price field for single products
+                    if 'Price' in parent_shopify_row:
+                        parent_shopify_row['Price'] = parent_price
+                    if 'Variant Price' in parent_shopify_row:
+                        parent_shopify_row['Variant Price'] = parent_price
+                    logger.debug(f"Set price {parent_price} for single product {base_name}")
                     
                     # Get SKU from source row
                     parent_sku = parent_row.get('SKU', '')
@@ -634,6 +782,56 @@ class MigrationOrchestrator:
                         parent_shopify_row['Option1 name'] = ""
                     if 'Option1 value' in parent_shopify_row:
                         parent_shopify_row['Option1 value'] = ""
+                    
+                    # FINAL CHECK: Ensure single product has valid price before adding
+                    # Check all possible price fields in parent_shopify_row
+                    final_price_check = None
+                    price_fields_to_check = ['Price', 'Variant Price', 'Regular price']
+                    
+                    for price_field in price_fields_to_check:
+                        if price_field in parent_shopify_row:
+                            price_val = parent_shopify_row[price_field]
+                            # Check if price is not empty, not NaN, and not 'nan' string
+                            if price_val is not None and pd.notna(price_val) and str(price_val).strip() != '' and str(price_val).strip().lower() != 'nan':
+                                try:
+                                    price_float = float(str(price_val).replace('₹', '').replace(',', '').replace('$', '').strip())
+                                    if price_float > 0:
+                                        final_price_check = price_float
+                                        logger.debug(f"Final price check passed for {base_name}: {price_float} from {price_field}")
+                                        break
+                                except Exception as e:
+                                    logger.debug(f"Could not parse price from {price_field} for {base_name}: {e}")
+                    
+                    # If still no valid price, also check transformed_parent as fallback
+                    if not final_price_check or final_price_check <= 0:
+                        for price_field in price_fields_to_check:
+                            if price_field in transformed_parent:
+                                price_val = transformed_parent[price_field]
+                                if price_val is not None and pd.notna(price_val) and str(price_val).strip() != '' and str(price_val).strip().lower() != 'nan':
+                                    try:
+                                        price_float = float(str(price_val).replace('₹', '').replace(',', '').replace('$', '').strip())
+                                        if price_float > 0:
+                                            # Set it in parent_shopify_row
+                                            if 'Variant Price' in parent_shopify_row:
+                                                parent_shopify_row['Variant Price'] = f"{price_float:.2f}"
+                                            if 'Price' in parent_shopify_row:
+                                                parent_shopify_row['Price'] = f"{price_float:.2f}"
+                                            final_price_check = price_float
+                                            logger.debug(f"Final price check passed (from transformed) for {base_name}: {price_float}")
+                                            break
+                                    except:
+                                        pass
+                    
+                    if not final_price_check or final_price_check <= 0:
+                        logger.warning(f"Skipping single product {base_name} - final price check failed (no valid price set in any field)")
+                        errors.append({
+                            'row_number': parent_row.name + 2,
+                            'type': 'zero_price_final_check',
+                            'errors': ['Single product has no valid price after processing'],
+                            'row_data': {'base_name': base_name, 'price_fields_checked': price_fields_to_check}
+                        })
+                        self.stats['failed_rows'] += 1
+                        continue
                 else:
                     # This product HAS VARIANTS
                     # CRITICAL: Parent product MUST NOT have ANY variant-specific fields populated
@@ -669,16 +867,17 @@ class MigrationOrchestrator:
                 self.stats['successful_rows'] += 1
                 
                 # Create additional rows for remaining images (Shopify requires separate rows for each image)
-                for img_idx in range(1, len(parent_images)):
-                    image_row = parent_shopify_row.copy()
-                    # Clear Title for additional image rows (only first row has Title)
-                    if 'Title' in image_row:
-                        image_row['Title'] = ""
-                    # Set this image URL
-                    if 'Product image URL' in image_row:
-                        image_row['Product image URL'] = parent_images[img_idx]
-                    shopify_rows.append(image_row)
-                    self.stats['successful_rows'] += 1
+                if parent_images:
+                    for img_idx in range(1, len(parent_images)):
+                        image_row = parent_shopify_row.copy()
+                        # Clear Title for additional image rows (only first row has Title)
+                        if 'Title' in image_row:
+                            image_row['Title'] = ""
+                        # Set this image URL
+                        if 'Product image URL' in image_row:
+                            image_row['Product image URL'] = parent_images[img_idx]
+                        shopify_rows.append(image_row)
+                        self.stats['successful_rows'] += 1
                 
                 # Process variants
                 # Get parent images to copy to variants if they don't have one
@@ -708,9 +907,14 @@ class MigrationOrchestrator:
                         image_urls = [url.strip() for url in str(variant_image_str).split(',') if url.strip()]
                         variant_images = [url for url in image_urls if url and url != 'nan']
                     
-                    # If variant doesn't have images, use parent's first image
-                    if not variant_images and parent_image_first:
-                        variant_images = [parent_image_first]
+                    # CRITICAL: Variants must have images (either their own or parent's)
+                    if not variant_images:
+                        if parent_image_first:
+                            variant_images = [parent_image_first]
+                        else:
+                            # Skip variant without image (parent also has no image)
+                            logger.warning(f"Skipping variant {variant_row.get('SKU', '')} - no image (parent also has no image)")
+                            continue
                     
                     # Extract variant option value (try from name first, then SKU)
                     variant_option = self._extract_variant_option(
@@ -896,42 +1100,24 @@ class MigrationOrchestrator:
                                         variant_shopify_row[col] = "shopify"
                                     break
                     
-                    # CRITICAL: Ensure variant has valid price - check multiple price fields
-                    # Check Price, Variant Price, and Regular price fields
-                    variant_price = None
-                    variant_price_value = 0.0
-                    for price_field in ['Price', 'Variant Price', 'Regular price']:
-                        price_val = variant_shopify_row.get(price_field, '')
-                        if price_val and pd.notna(price_val) and str(price_val).strip() != '' and str(price_val).strip() != 'nan':
-                            # Check if price is not zero
-                            try:
-                                price_float = float(str(price_val).replace('₹', '').replace(',', '').strip())
-                                if price_float > 0:
-                                    variant_price = price_val
-                                    variant_price_value = price_float
-                                    break
-                            except:
-                                pass
-                    
-                    # If no valid price found, skip this variant
-                    if not variant_price or variant_price_value <= 0:
-                        logger.warning(f"Skipping variant with zero/invalid price: Handle={handle}, SKU={variant_row.get('SKU', '')}")
+                    # CRITICAL: Ensure variant has valid price sourced directly from the original data
+                    variant_price = self._extract_source_price(variant_row)
+                    if not variant_price:
+                        logger.warning(f"Skipping variant with zero/invalid price: Handle={handle}, SKU={variant_row.get('SKU', '')}, Name={str(variant_row.get('Name', ''))[:50]}")
                         continue  # Skip variants without valid price
+                    try:
+                        variant_price_value = float(variant_price)
+                        if variant_price_value <= 0:
+                            logger.warning(f"Skipping variant with zero price after parsing: Handle={handle}, SKU={variant_row.get('SKU', '')}")
+                            continue
+                    except Exception as e:
+                        logger.warning(f"Skipping variant with unparsable price '{variant_price}': Handle={handle}, error={e}")
+                        continue
                     
-                    # DOUBLE CHECK: Ensure price is set correctly in all price fields
-                    # Set price in Variant Price field (after column mapping it will be 'Variant Price')
+                    # Set price in Variant Price (and Price if necessary)
                     for price_field in ['Price', 'Variant Price']:
                         if price_field in variant_shopify_row:
                             variant_shopify_row[price_field] = variant_price
-                    
-                    # DOUBLE CHECK: Verify price is not zero one more time
-                    try:
-                        final_price_check = float(str(variant_price).replace('₹', '').replace(',', '').strip())
-                        if final_price_check <= 0:
-                            logger.warning(f"Variant still has zero price after fix, skipping: Handle={handle}")
-                            continue
-                    except:
-                        pass
                     
                     shopify_rows.append(variant_shopify_row)
                     self.stats['successful_rows'] += 1
@@ -946,7 +1132,7 @@ class MigrationOrchestrator:
                         if 'Variant image URL' in variant_image_row:
                             variant_image_row['Variant image URL'] = variant_images[img_idx]
                         shopify_rows.append(variant_image_row)
-                        self.stats['successful_rows'] += 1
+                    self.stats['successful_rows'] += 1
                 
                 self.stats['processed_rows'] += len(group_df)
                 
@@ -961,6 +1147,59 @@ class MigrationOrchestrator:
                 self.stats['failed_rows'] += len(group_df)
                 if not self._should_continue_on_error():
                     break
+        
+        # CRITICAL: Remove any single products with zero prices that slipped through
+        # This is a final safety check - do it AFTER all rows are collected
+        # First, build a map of handles to see which products have variants
+        handle_to_has_variants = {}
+        for row in shopify_rows:
+            handle = row.get('URL handle', '') or row.get('Handle', '')
+            title = row.get('Title', '')
+            if handle:
+                if handle not in handle_to_has_variants:
+                    handle_to_has_variants[handle] = False
+                # If this row has no title, it's a variant row
+                if not title or pd.isna(title) or str(title).strip() == '':
+                    # Check if it's actually a variant (has SKU and Option1 Value)
+                    sku = row.get('Variant SKU', '') or row.get('SKU', '')
+                    option1 = row.get('Option1 Value', '') or row.get('Option1 value', '')
+                    if sku and pd.notna(sku) and str(sku).strip() != '' and option1 and pd.notna(option1) and str(option1).strip() != '':
+                        handle_to_has_variants[handle] = True
+        
+        # Now filter out single products with zero prices
+        filtered_shopify_rows = []
+        removed_count = 0
+        for row in shopify_rows:
+            title = row.get('Title', '')
+            if title and pd.notna(title) and str(title).strip() != '':
+                # This is a parent row - check if it has variants
+                handle = row.get('URL handle', '') or row.get('Handle', '')
+                has_variants = handle_to_has_variants.get(handle, False) if handle else False
+                
+                # If no variants, it's a single product - must have valid price
+                if not has_variants:
+                    price = None
+                    for price_field in ['Price', 'Variant Price', 'Regular price']:
+                        price_val = row.get(price_field, '')
+                        if price_val and pd.notna(price_val) and str(price_val).strip() != '' and str(price_val).strip().lower() != 'nan':
+                            try:
+                                price_float = float(str(price_val).replace('₹', '').replace(',', '').replace('$', '').strip())
+                                if price_float > 0:
+                                    price = price_float
+                                    break
+                            except:
+                                pass
+                    
+                    if not price or price <= 0:
+                        logger.warning(f"Removing single product '{title}' (handle: {handle}) - zero price detected in final filter")
+                        removed_count += 1
+                        continue  # Skip this row and all its image rows
+            
+            filtered_shopify_rows.append(row)
+        
+        if removed_count > 0:
+            logger.warning(f"Removed {removed_count} single products with zero prices in final filter")
+            shopify_rows = filtered_shopify_rows
         
         # Create output DataFrame
         if shopify_rows:
@@ -1106,29 +1345,31 @@ class MigrationOrchestrator:
                                 if not variant_image or str(variant_image).strip() == '' or str(variant_image).strip() == 'nan':
                                     shopify_df.at[idx, 'Variant Image'] = str(parent_image).strip()
             
-            # 3. CRITICAL FIX: Remove rows with zero prices in variants (they should have been filtered earlier)
+            # 3. CRITICAL FIX: Remove rows with zero prices (both variants AND single products)
             if 'Variant Price' in shopify_df.columns:
                 rows_to_remove = []
                 for idx, row in shopify_df.iterrows():
-                    # Only check variants (rows without Title)
-                    if pd.isna(row.get('Title')) or str(row.get('Title', '')).strip() == '':
                         variant_price = row.get('Variant Price', '')
                         if variant_price and pd.notna(variant_price):
                             try:
-                                price_val = float(str(variant_price).replace('₹', '').replace(',', '').strip())
+                                price_val = float(str(variant_price).replace('₹', '').replace('$', '').replace(',', '').strip())
                                 if price_val <= 0:
-                                    # Zero or negative price found - remove this row
-                                    logger.warning(f"Removing variant with zero/negative price: Handle={row.get('Handle', '')}, SKU={row.get('Variant SKU', '')}, Price={price_val}")
+                                    # Zero or negative price found - remove this row (both variants and single products)
+                                    is_variant = pd.isna(row.get('Title')) or str(row.get('Title', '')).strip() == ''
+                                    row_type = 'variant' if is_variant else 'single product'
+                                    logger.warning(f"Removing {row_type} with zero/negative price: Handle={row.get('Handle', '')}, Title={str(row.get('Title', ''))[:50]}, SKU={row.get('Variant SKU', '')}, Price={price_val}")
                                     rows_to_remove.append(idx)
                             except:
-                                # If price can't be parsed and it's a variant, check if it's empty
+                                # If price can't be parsed, check if it's empty
                                 if not variant_price or str(variant_price).strip() == '' or str(variant_price).strip() == 'nan':
-                                    logger.warning(f"Removing variant with empty/invalid price: Handle={row.get('Handle', '')}, SKU={row.get('Variant SKU', '')}")
+                                    is_variant = pd.isna(row.get('Title')) or str(row.get('Title', '')).strip() == ''
+                                    row_type = 'variant' if is_variant else 'single product'
+                                    logger.warning(f"Removing {row_type} with empty/invalid price: Handle={row.get('Handle', '')}, Title={str(row.get('Title', ''))[:50]}, SKU={row.get('Variant SKU', '')}")
                                     rows_to_remove.append(idx)
                 
                 if rows_to_remove:
                     shopify_df = shopify_df.drop(rows_to_remove)
-                    logger.info(f"Removed {len(rows_to_remove)} variants with zero/invalid prices")
+                    logger.info(f"Removed {len(rows_to_remove)} rows (variants + single products) with zero/invalid prices")
                     self.stats['failed_rows'] += len(rows_to_remove)
             
             # 4. FINAL FIX: Ensure variant Option1 Value and Name are set correctly
@@ -1217,23 +1458,66 @@ class MigrationOrchestrator:
                 if single_products_no_price:
                     logger.warning(f"Found {len(single_products_no_price)} single products without price: {single_products_no_price[:5]}...")
             
-            # 7. FINAL DOUBLE CHECK: Ensure no zero prices remain
+            # 7. FINAL DOUBLE CHECK: Ensure no zero prices remain (both variants AND single products)
             if 'Variant Price' in shopify_df.columns:
                 zero_price_count = 0
+                rows_to_remove_final = []
                 for idx, row in shopify_df.iterrows():
-                    if pd.isna(row.get('Title')) or str(row.get('Title', '')).strip() == '':
-                        variant_price = row.get('Variant Price', '')
-                        if variant_price and pd.notna(variant_price):
-                            try:
-                                price_val = float(str(variant_price).replace('₹', '').replace(',', '').strip())
-                                if price_val <= 0:
-                                    zero_price_count += 1
-                                    logger.error(f"CRITICAL: Variant still has zero price after all fixes: Handle={row.get('Handle', '')}, SKU={row.get('Variant SKU', '')}")
-                            except:
-                                pass
+                    variant_price = row.get('Variant Price', '')
+                    if variant_price and pd.notna(variant_price):
+                        try:
+                            price_val = float(str(variant_price).replace('₹', '').replace('$', '').replace(',', '').strip())
+                            if price_val <= 0:
+                                zero_price_count += 1
+                                is_variant = pd.isna(row.get('Title')) or str(row.get('Title', '')).strip() == ''
+                                row_type = 'variant' if is_variant else 'single product'
+                                logger.error(f"CRITICAL: {row_type} still has zero price after all fixes: Handle={row.get('Handle', '')}, Title={str(row.get('Title', ''))[:50]}, SKU={row.get('Variant SKU', '')}")
+                                rows_to_remove_final.append(idx)
+                        except:
+                            pass
+                
+                if rows_to_remove_final:
+                    shopify_df = shopify_df.drop(rows_to_remove_final)
+                    logger.info(f"FINAL CLEANUP: Removed {len(rows_to_remove_final)} rows with zero prices")
+                    self.stats['failed_rows'] += len(rows_to_remove_final)
                 
                 if zero_price_count > 0:
-                    logger.error(f"CRITICAL: {zero_price_count} variants still have zero prices after all validation!")
+                    logger.error(f"CRITICAL: {zero_price_count} rows still had zero prices - they have been removed!")
+            
+            # 8. FINAL CHECK: Ensure ALL products have descriptions with proper HTML format
+            desc_col = None
+            for col in ['Description', 'Body (HTML)']:
+                if col in shopify_df.columns:
+                    desc_col = col
+                    break
+            
+            if desc_col:
+                missing_desc_count = 0
+                wrapped_desc_count = 0
+                for idx, row in shopify_df.iterrows():
+                    # Only check parent rows (rows with Title)
+                    if pd.notna(row.get('Title')) and str(row.get('Title', '')).strip() != '':
+                        product_name = str(row.get('Title', 'Product')).strip()
+                        desc = row.get(desc_col, '')
+                        if not desc or pd.isna(desc) or str(desc).strip() == '' or str(desc).strip().lower() == 'nan':
+                            # Missing description - leave it empty (no default text)
+                            shopify_df.at[idx, desc_col] = ""
+                            missing_desc_count += 1
+                            logger.debug(f"Product '{product_name}' has no description - leaving empty")
+                        else:
+                            # Check if description has proper simple format (no tabs)
+                            desc_str = str(desc).strip()
+                            if 'tabs-container' not in desc_str and 'tab-content' not in desc_str:
+                                # Description exists but doesn't have simple format - format it
+                                wrapped_desc = self.transformer._wrap_description_in_tabs(desc_str)
+                                shopify_df.at[idx, desc_col] = wrapped_desc
+                                wrapped_desc_count += 1
+                                logger.info(f"Formatted description for product '{product_name}' in simple format")
+                
+                if missing_desc_count > 0:
+                    logger.info(f"Found {missing_desc_count} products with no description (left empty)")
+                if wrapped_desc_count > 0:
+                    logger.info(f"Formatted {wrapped_desc_count} descriptions in simple format")
             
             # 8. CRITICAL FIX: Ensure fulfillment service is always set for ALL ROWS that need it (Shopify requirement)
             # - Single products (has Title, no variants) MUST have fulfillment service set

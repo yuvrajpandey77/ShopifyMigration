@@ -126,7 +126,7 @@ class DataTransformer:
         # Always set to "manual" for all products/variants
         if 'Fulfillment service' in transformed:
             # Shopify requires fulfillment service to be set, so always use "manual"
-            transformed['Fulfillment service'] = 'manual'
+                transformed['Fulfillment service'] = 'manual'
         
         # Ensure "Continue selling when out of stock" (Inventory policy) is set correctly
         if 'Continue selling when out of stock' in transformed:
@@ -358,17 +358,57 @@ class DataTransformer:
         
         return handle
     
+    def _create_default_description(self, product_name: str = "") -> str:
+        """
+        Create a default description with simple heading/paragraph format when no description is available.
+        
+        Args:
+            product_name: Name of the product
+            
+        Returns:
+            HTML string with headings and paragraphs (NO TABS)
+        """
+        product_name = product_name or "Product"
+        
+        default_html = f"""<h4>Overview</h4>
+<p>{product_name} - Product details coming soon.</p>
+
+<h4>Specifications</h4>
+<p>Specifications will be added soon.</p>
+
+<h4>Additional Information</h4>
+<p>Additional information will be added soon.</p>"""
+        return default_html
+    
+    def _wrap_description_in_tabs(self, description_text: str) -> str:
+        """
+        Format existing description text with simple heading/paragraph format.
+        
+        Args:
+            description_text: Plain text or HTML description
+            
+        Returns:
+            HTML string with headings and paragraphs (NO TABS)
+        """
+        # Clean the description text
+        desc_clean = str(description_text).strip()
+        desc_clean = desc_clean.replace('\\n', '\n')
+        
+        # Use the simple structure format (no tabs)
+        return self._structure_description_simple(desc_clean)
+    
     def _transform_html(self, value: Any) -> str:
         """
         Transform HTML content (clean and validate).
         Converts literal \n to HTML line breaks and fixes formatting.
-        Creates structured description with tabs: Overview, Specifications, Reviews, Additional.
+        Creates structured description with headings and paragraphs (NO TABS).
+        PRESERVES original colors and styles from source.
         
         Args:
             value: HTML content
             
         Returns:
-            Cleaned HTML string with tabbed sections
+            Cleaned HTML string with headings and paragraphs (preserves original formatting)
         """
         if pd.isna(value):
             return ""
@@ -378,25 +418,13 @@ class DataTransformer:
         # Convert literal \n (escaped newlines) to actual newlines
         html = html.replace('\\n', '\n')
         
-        # Basic HTML cleaning (remove script tags, etc.)
+        # Basic HTML cleaning (remove script tags only - preserve everything else)
         html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
         
-        # CRITICAL: Remove all color styles from HTML to ensure standard black text
-        # Remove inline color styles from all tags
-        html = re.sub(r'\s*color\s*:\s*[^;\"\']+;?', '', html, flags=re.IGNORECASE)
-        html = re.sub(r'\s*color\s*=\s*[\"\'][^\"\']+[\"\']', '', html, flags=re.IGNORECASE)
+        # DO NOT remove colors - preserve original source formatting
         
-        # Remove style attributes that only contain color (or are empty after color removal)
-        html = re.sub(r'\s*style\s*=\s*[\"\'][^\"\']*color[^\"\']*[\"\']', '', html, flags=re.IGNORECASE)
-        
-        # Clean up empty style attributes
-        html = re.sub(r'\s*style\s*=\s*[\"\']\s*[\"\']', '', html, flags=re.IGNORECASE)
-        
-        # Remove any remaining color-related CSS
-        html = re.sub(r'color\s*[:=]\s*[^;\"\']+', '', html, flags=re.IGNORECASE)
-        
-        # Structure content into tabs: Overview, Specifications, Reviews, Additional
-        html = self._structure_description_with_tabs(html)
+        # Structure content into simple format with headings and paragraphs (NO TABS)
+        html = self._structure_description_simple(html)
         
         # Clean up multiple consecutive <br> tags (more than 2)
         html = re.sub(r'(<br>\s*){3,}', '<br><br>', html, flags=re.IGNORECASE)
@@ -409,163 +437,149 @@ class DataTransformer:
         
         return html
     
-    def _structure_description_with_tabs(self, content: str) -> str:
+    def _structure_description_simple(self, content: str) -> str:
         """
-        Structure description content into interactive tabbed sections with modern styling.
-        Uses the provided tab system with Overview, Specifications, and Additional tabs.
+        Structure description content into a simple format with headings and paragraphs.
+        Only uses Overview and Specifications sections - NO Additional Information.
+        Uses ONLY source file content - NO placeholder text.
+        Preserves original source content without modifying colors or styles.
         
         Args:
             content: Raw HTML or text content
             
         Returns:
-            Structured HTML with interactive tab sections
+            Structured HTML with headings and paragraphs (no tabs, only Overview and Specifications)
         """
-        # Remove existing HTML tags temporarily to parse content
-        text_content = re.sub(r'<[^>]+>', ' ', content)
-        text_content = ' '.join(text_content.split())
-        
-        # Split content into lines for processing
-        lines = content.split('\n')
-        cleaned_lines = [line.strip() for line in lines if line.strip()]
-        
-        # Try to detect existing sections
-        overview_content = []
-        specifications_content = []
-        additional_content = []
-        
-        current_section = 'overview'
-        section_keywords = {
-            'overview': ['overview', 'description', 'about', 'introduction', 'details', 'product'],
-            'specifications': ['specification', 'spec', 'features', 'technical', 'dimensions', 'size', 'weight', 'material', 'details'],
-            'additional': ['additional', 'info', 'information', 'notes', 'warranty', 'shipping', 'return', 'care', 'instructions']
-        }
-        
-        # Parse content into sections
-        for line in cleaned_lines:
-            line_lower = line.lower()
-            # Check if line indicates a section change
-            section_found = False
-            for section, keywords in section_keywords.items():
-                for keyword in keywords:
-                    if keyword in line_lower and len(line) < 100:  # Likely a heading
-                        current_section = section
-                        section_found = True
-                        break
-                if section_found:
-                    break
+        # Check if content has explicit specification marker from mapper
+        if '---SPECIFICATIONS---' in content:
+            parts = content.split('---SPECIFICATIONS---')
+            overview_content_raw = parts[0].strip() if len(parts) > 0 else ''
+            specs_content_raw = parts[1].strip() if len(parts) > 1 else ''
+        else:
+            # Split content into lines for processing
+            lines = content.split('\n')
+            cleaned_lines = [line.strip() for line in lines if line.strip()]
             
-            # Add line to appropriate section (skip the heading line itself)
-            if not section_found:
-                if current_section == 'overview':
-                    overview_content.append(line)
-                elif current_section == 'specifications':
-                    specifications_content.append(line)
-                else:
-                    additional_content.append(line)
+            # Try to detect existing sections
+            overview_content_raw = []
+            specs_content_raw = []
+            
+            current_section = 'overview'
+            section_keywords = {
+                'overview': ['overview', 'description', 'about', 'introduction', 'details', 'product'],
+                'specifications': ['specification', 'spec', 'features', 'technical', 'dimensions', 'size', 'weight', 'material']
+            }
+            
+            # Parse content into sections
+            for line in cleaned_lines:
+                line_lower = line.lower()
+                # Check if line indicates a section change
+                section_found = False
+                for section, keywords in section_keywords.items():
+                    for keyword in keywords:
+                        if keyword in line_lower and len(line) < 100:  # Likely a heading
+                            current_section = section
+                            section_found = True
+                            break
+                    if section_found:
+                        break
+                
+                # Add line to appropriate section (skip the heading line itself)
+                if not section_found:
+                    if current_section == 'overview':
+                        overview_content_raw.append(line)
+                    elif current_section == 'specifications':
+                        specs_content_raw.append(line)
+            
+            # If no content was parsed into sections, put everything in overview
+            if not overview_content_raw and not specs_content_raw:
+                overview_content_raw = cleaned_lines if cleaned_lines else [content]
+            
+            # Convert lists to strings
+            overview_content_raw = '\n'.join(overview_content_raw) if isinstance(overview_content_raw, list) else overview_content_raw
+            specs_content_raw = '\n'.join(specs_content_raw) if isinstance(specs_content_raw, list) else specs_content_raw
         
-        # If no content was parsed into sections, put everything in overview
-        if not overview_content and not specifications_content and not additional_content:
-            overview_content = cleaned_lines if cleaned_lines else [content]
-        
-        # Format content for each section
-        overview_html = self._format_section_content(overview_content) if overview_content else '<p>Product description and details.</p>'
-        specs_html = self._format_section_content(specifications_content) if specifications_content else '<p>Technical specifications and features.</p>'
-        additional_html = self._format_section_content(additional_content) if additional_content else '<p>Additional product information.</p>'
-        
-        # Build structured HTML with the new responsive tab system
+        # Format content for each section (ONLY if content exists - NO placeholder text)
         structured_html = []
         
-        # Add CSS styles with responsive design
-        structured_html.append('<style>')
-        structured_html.append('    .tabs-container {')
-        structured_html.append('        display: flex;')
-        structured_html.append('        gap: 12px;')
-        structured_html.append('        margin-bottom: 20px;')
-        structured_html.append('        flex-wrap: wrap; /* Makes it responsive */')
-        structured_html.append('    }')
-        structured_html.append('    .tab {')
-        structured_html.append('        padding: 12px 24px;')
-        structured_html.append('        background: #F3F4F6;')
-        structured_html.append('        border-radius: 12px;')
-        structured_html.append('        cursor: pointer;')
-        structured_html.append('        font-size: 16px;')
-        structured_html.append('        color: #444;')
-        structured_html.append('        transition: 0.3s;')
-        structured_html.append('        font-weight: 500;')
-        structured_html.append('        white-space: nowrap; /* Prevents breaking text */')
-        structured_html.append('    }')
-        structured_html.append('    .tab.active {')
-        structured_html.append('        background: #000000;')
-        structured_html.append('        color: #ffffff;')
-        structured_html.append('    }')
-        structured_html.append('    .tab-content {')
-        structured_html.append('        display: none;')
-        structured_html.append('        font-size: 16px;')
-        structured_html.append('        padding: 10px 0;')
-        structured_html.append('    }')
-        structured_html.append('    .tab-content.active {')
-        structured_html.append('        display: block;')
-        structured_html.append('    }')
-        structured_html.append('    /* ===== RESPONSIVE DESIGN ===== */')
-        structured_html.append('    @media (max-width: 600px) {')
-        structured_html.append('        .tabs-container {')
-        structured_html.append('            gap: 8px;')
-        structured_html.append('        }')
-        structured_html.append('        .tab {')
-        structured_html.append('            padding: 10px 18px;')
-        structured_html.append('            font-size: 14px;')
-        structured_html.append('            border-radius: 10px;')
-        structured_html.append('        }')
-        structured_html.append('    }')
-        structured_html.append('    @media (max-width: 400px) {')
-        structured_html.append('        .tab {')
-        structured_html.append('            padding: 8px 15px;')
-        structured_html.append('            font-size: 13px;')
-        structured_html.append('        }')
-        structured_html.append('    }')
-        structured_html.append('</style>')
+        # Overview section - ONLY if we have content
+        if overview_content_raw and str(overview_content_raw).strip():
+            overview_lines = overview_content_raw.split('\n') if isinstance(overview_content_raw, str) else overview_content_raw
+            overview_html = self._format_section_content_simple(overview_lines)
+            if overview_html and overview_html.strip() and overview_html != '<p></p>':
+                structured_html.append('<h4>Overview</h4>')
+                structured_html.append(overview_html)
         
-        # Add tabs wrapper
-        structured_html.append('<div class="tabs-wrapper">')
+        # Specifications section - ONLY if we have content
+        if specs_content_raw and str(specs_content_raw).strip():
+            specs_lines = specs_content_raw.split('\n') if isinstance(specs_content_raw, str) else specs_content_raw
+            specs_html = self._format_section_content_simple(specs_lines)
+            if specs_html and specs_html.strip() and specs_html != '<p></p>':
+                structured_html.append('<h4>Specifications</h4>')
+                structured_html.append(specs_html)
         
-        # Tabs
-        structured_html.append('    <div class="tabs-container">')
-        structured_html.append('        <div class="tab active" data-tab="overview">Overview</div>')
-        structured_html.append('        <div class="tab" data-tab="specs">Specifications</div>')
-        structured_html.append('        <div class="tab" data-tab="additional">Additional</div>')
-        structured_html.append('    </div>')
+        # Return structured HTML - if no content, return empty string (NO placeholder text)
+        if structured_html:
+            return '\n'.join(structured_html)
+        else:
+            return ''  # Return empty if no content - NO placeholder text
+    
+    def _format_section_content_simple(self, lines: List[str]) -> str:
+        """
+        Format section content preserving original HTML/formatting.
+        Uses simple paragraphs, preserves colors and styles from source.
         
-        # Tab Contents (product-specific content)
-        structured_html.append('    <div id="overview" class="tab-content active">')
-        structured_html.append(f'        {overview_html}')
-        structured_html.append('    </div>')
+        Args:
+            lines: List of content lines
+            
+        Returns:
+            Formatted HTML string preserving original content
+        """
+        if not lines:
+            return '<p></p>'
         
-        structured_html.append('    <div id="specs" class="tab-content">')
-        structured_html.append(f'        {specs_html}')
-        structured_html.append('    </div>')
+        formatted = []
+        current_paragraph = []
         
-        structured_html.append('    <div id="additional" class="tab-content">')
-        structured_html.append(f'        {additional_html}')
-        structured_html.append('    </div>')
+        for line in lines:
+            line = line.strip()
+            if not line:
+                # Empty line - close current paragraph if any
+                if current_paragraph:
+                    para_text = ' '.join(current_paragraph)
+                    # Preserve original HTML if present, otherwise wrap in <p>
+                    if para_text.startswith('<') and para_text.endswith('>'):
+                        formatted.append(para_text)
+                    else:
+                        formatted.append(f'<p>{para_text}</p>')
+                    current_paragraph = []
+                continue
+            
+            # Check if line is already HTML
+            if line.startswith('<') and line.endswith('>'):
+                # Close current paragraph if any
+                if current_paragraph:
+                    para_text = ' '.join(current_paragraph)
+                    if para_text.startswith('<') and para_text.endswith('>'):
+                        formatted.append(para_text)
+                    else:
+                        formatted.append(f'<p>{para_text}</p>')
+                    current_paragraph = []
+                # Add HTML line as-is (preserve original formatting)
+                formatted.append(line)
+            else:
+                # Regular text - add to current paragraph
+                current_paragraph.append(line)
         
-        structured_html.append('</div>')
+        # Close any remaining paragraph
+        if current_paragraph:
+            para_text = ' '.join(current_paragraph)
+            if para_text.startswith('<') and para_text.endswith('>'):
+                formatted.append(para_text)
+            else:
+                formatted.append(f'<p>{para_text}</p>')
         
-        # Add JavaScript for tab functionality
-        structured_html.append('<script>')
-        structured_html.append('    const tabs = document.querySelectorAll(\'.tab\');')
-        structured_html.append('    const contents = document.querySelectorAll(\'.tab-content\');')
-        structured_html.append('    tabs.forEach(tab => {')
-        structured_html.append('        tab.addEventListener(\'click\', () => {')
-        structured_html.append('            tabs.forEach(t => t.classList.remove(\'active\'));')
-        structured_html.append('            tab.classList.add(\'active\');')
-        structured_html.append('            contents.forEach(c => c.classList.remove(\'active\'));')
-        structured_html.append('            const target = document.getElementById(tab.dataset.tab);')
-        structured_html.append('            if (target) target.classList.add(\'active\');')
-        structured_html.append('        });')
-        structured_html.append('    });')
-        structured_html.append('</script>')
-        
-        return '\n'.join(structured_html)
+        return '\n'.join(formatted) if formatted else '<p></p>'
     
     def _format_section_content(self, lines: List[str]) -> str:
         """

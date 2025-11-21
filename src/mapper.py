@@ -65,28 +65,53 @@ class FieldMapper:
         # CRITICAL: Ensure Description field is populated from any available source
         # Check Description, Short description, and Meta: rank_math_description
         description_parts = []
+        specification_parts = []
         
-        # Check Description field
+        # Check Description field (for Overview)
         if 'Description' in source_row:
             desc = source_row['Description']
             if pd.notna(desc) and str(desc).strip() != '' and str(desc).strip().lower() != 'nan':
                 description_parts.append(str(desc).strip())
         
-        # Check Short description field
+        # Check Short description field (for Overview)
         if 'Short description' in source_row:
             short_desc = source_row['Short description']
             if pd.notna(short_desc) and str(short_desc).strip() != '' and str(short_desc).strip().lower() != 'nan':
                 description_parts.append(str(short_desc).strip())
         
-        # Check Meta: rank_math_description as fallback
+        # Check Meta: rank_math_description as fallback (for Overview)
         if 'Meta: rank_math_description' in source_row and len(description_parts) == 0:
             meta_desc = source_row['Meta: rank_math_description']
             if pd.notna(meta_desc) and str(meta_desc).strip() != '' and str(meta_desc).strip().lower() != 'nan':
                 description_parts.append(str(meta_desc).strip())
         
-        # Combine all description parts and set to Description field
-        if description_parts:
-            combined_description = '\n\n'.join(description_parts)
+        # Check for specification fields (Meta: features, Meta: texhnical_specs, etc.)
+        spec_fields = ['Meta: features', 'Meta: texhnical_specs', 'Meta: _features', 'Meta: _texhnical_specs', 
+                       'Meta: upper_feature', 'Meta: _upper_featureupper_feature', 'Meta: _upper_featureupper_feature']
+        for spec_field in spec_fields:
+            if spec_field in source_row:
+                spec = source_row[spec_field]
+                if pd.notna(spec) and str(spec).strip() != '' and str(spec).strip().lower() != 'nan':
+                    specification_parts.append(str(spec).strip())
+        
+        # Combine description parts for Overview
+        overview_content = '\n\n'.join(description_parts) if description_parts else ''
+        
+        # Combine specification parts
+        specs_content = '\n\n'.join(specification_parts) if specification_parts else ''
+        
+        # Combine Overview and Specifications with markers for transformer to parse
+        combined_description = ''
+        if overview_content:
+            combined_description = overview_content
+        if specs_content:
+            if combined_description:
+                combined_description += '\n\n---SPECIFICATIONS---\n\n' + specs_content
+            else:
+                combined_description = '---SPECIFICATIONS---\n\n' + specs_content
+        
+        # Set to Description field if we have any content
+        if combined_description:
             # Find the target field for Description
             desc_target = None
             for source_field, shopify_field in direct_mappings.items():
