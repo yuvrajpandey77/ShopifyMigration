@@ -149,6 +149,22 @@ class CSVHandler:
                 # Replace 'nan' string with empty string
                 df[col] = df[col].replace('nan', '')
             
+            # CRITICAL: Ensure Option1 Value is never empty for rows with blank titles
+            # This prevents "Title can't be blank" errors from Shopify
+            if 'Title' in df.columns and 'Option1 Value' in df.columns:
+                for idx in df.index:
+                    title = str(df.at[idx, 'Title']).strip()
+                    option1 = str(df.at[idx, 'Option1 Value']).strip()
+                    handle = str(df.at[idx, 'Handle']).strip() if 'Handle' in df.columns else ''
+                    
+                    # If title is empty, Option1 Value MUST be set
+                    if not title or title == '':
+                        if not option1 or option1 == '':
+                            # Set a default Option1 Value
+                            default_option1 = f"Variant-{idx}" if not handle else f"Variant-{handle}"
+                            df.at[idx, 'Option1 Value'] = default_option1
+                            logger.warning(f"CSV Handler: Set default Option1 Value for row {idx} (Handle: {handle}) to prevent 'Title can't be blank' error")
+            
             df.to_csv(
                 file_path,
                 encoding=encoding,
