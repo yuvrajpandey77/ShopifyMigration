@@ -1372,9 +1372,11 @@ class MigrationOrchestrator:
                     logger.info(f"Removed {len(rows_to_remove)} rows (variants + single products) with zero/invalid prices")
                     self.stats['failed_rows'] += len(rows_to_remove)
             
-            # 4. FINAL FIX: Ensure variant Option1 Value and Name are set correctly
+            # 4. CRITICAL FIX: Ensure variant Option1 Value and Name are set correctly
             # Variant rows (empty Title) MUST have Option1 Value set
-            if 'Option1 Value' in shopify_df.columns and 'Title' in shopify_df.columns:
+            # For image rows, copy Option1 Value from parent variant instead of generating defaults
+            if 'Option1 Value' in shopify_df.columns and 'Title' in shopify_df.columns and 'Handle' in shopify_df.columns:
+                option1_fixes = 0
                 for idx, row in shopify_df.iterrows():
                     title = row.get('Title', '')
                     option1_val = row.get('Option1 Value', '')
@@ -1386,20 +1388,47 @@ class MigrationOrchestrator:
                     if is_variant_row:
                         # This is a variant row - it MUST have Option1 Value
                         if pd.isna(option1_val) or str(option1_val).strip() == '' or str(option1_val).strip().lower() == 'nan':
-                            # Try to extract from Variant SKU or generate a default
-                            variant_sku = row.get('Variant SKU', '')
-                            if variant_sku and pd.notna(variant_sku) and str(variant_sku).strip() != '':
-                                # Use SKU as Option1 Value if available
-                                shopify_df.at[idx, 'Option1 Value'] = str(variant_sku).strip()
-                            else:
-                                # Generate a default value based on row index
-                                shopify_df.at[idx, 'Option1 Value'] = f"Variant-{idx}"
+                            # First, try to get Option1 Value from another variant with the same handle
+                            option1_found = False
+                            if handle and pd.notna(handle) and str(handle).strip() != '':
+                                handle_rows = shopify_df[shopify_df['Handle'] == handle]
+                                # Find variant rows with Option1 Value (excluding current row)
+                                variants_with_option1 = handle_rows[
+                                    (handle_rows.index != idx) &
+                                    (handle_rows['Title'].isna() | (handle_rows['Title'].astype(str).str.strip() == '')) &
+                                    (handle_rows['Option1 Value'].notna()) &
+                                    (handle_rows['Option1 Value'].astype(str).str.strip() != '') &
+                                    (handle_rows['Option1 Value'].astype(str).str.strip().str.lower() != 'nan')
+                                ]
+                                if len(variants_with_option1) > 0:
+                                    # Copy Option1 Value from first parent variant
+                                    parent_option1 = variants_with_option1.iloc[0]['Option1 Value']
+                                    shopify_df.at[idx, 'Option1 Value'] = str(parent_option1).strip()
+                                    option1_found = True
+                                    option1_fixes += 1
+                            
+                            # If still not found, try to extract from Variant SKU
+                            if not option1_found:
+                                variant_sku = row.get('Variant SKU', '')
+                                if variant_sku and pd.notna(variant_sku) and str(variant_sku).strip() != '':
+                                    # Use SKU as Option1 Value if available
+                                    shopify_df.at[idx, 'Option1 Value'] = str(variant_sku).strip()
+                                    option1_fixes += 1
+                                else:
+                                    # Last resort: Generate a default value based on row index
+                                    # But this should rarely happen if image rows are created correctly
+                                    shopify_df.at[idx, 'Option1 Value'] = f"Variant-{idx}"
+                                    option1_fixes += 1
+                                    logger.warning(f"Generated default Option1 Value for row {idx} (Handle: {handle}) - this should be rare")
                             
                             # Also set Option1 Name if not set
                             if 'Option1 Name' in shopify_df.columns:
                                 option1_name = row.get('Option1 Name', '')
                                 if pd.isna(option1_name) or str(option1_name).strip() == '' or str(option1_name).strip().lower() == 'nan':
                                     shopify_df.at[idx, 'Option1 Name'] = 'Size'
+                
+                if option1_fixes > 0:
+                    logger.info(f"Fixed {option1_fixes} variant/image rows by setting Option1 Value (copied from parent variants or generated)")
             
             # 5. FINAL DOUBLE CHECK: Ensure inventory tracker is "shopify" for ALL rows with inventory
             # This includes both single products and variants
@@ -1458,27 +1487,89 @@ class MigrationOrchestrator:
                 if single_products_no_price:
                     logger.warning(f"Found {len(single_products_no_price)} single products without price: {single_products_no_price[:5]}...")
             
-            # 7. FINAL DOUBLE CHECK: Ensure no zero prices remain (both variants AND single products)
+            # 7. CRITICAL FIX: Ensure image rows (variant rows without SKU/Option1) inherit prices from their parent variant
+            # Image rows are variant rows (no title) that don't have SKU or Option1 Value
+            if 'Variant Price' in shopify_df.columns and 'Handle' in shopify_df.columns:
+                image_rows_fixed = 0
+                for handle in shopify_df['Handle'].unique():
+                    handle_rows = shopify_df[shopify_df['Handle'] == handle]
+                    # Find variant rows with prices (these are the actual variants)
+                    variant_rows_with_price = handle_rows[
+                        (handle_rows['Title'].isna() | (handle_rows['Title'] == '')) &
+                        (handle_rows['Variant Price'].notna()) &
+                        (handle_rows['Variant Price'].astype(str).str.strip() != '') &
+                        (handle_rows['Variant Price'].astype(str).str.strip() != 'nan')
+                    ]
+                    
+                    if len(variant_rows_with_price) > 0:
+                        # Get the first variant's price to use for image rows
+                        first_variant_price = variant_rows_with_price.iloc[0]['Variant Price']
+                        
+                        # Find image rows (variant rows without price)
+                        image_rows = handle_rows[
+                            (handle_rows['Title'].isna() | (handle_rows['Title'] == '')) &
+                            (
+                                (handle_rows['Variant Price'].isna()) |
+                                (handle_rows['Variant Price'].astype(str).str.strip() == '') |
+                                (handle_rows['Variant Price'].astype(str).str.strip() == 'nan')
+                            )
+                        ]
+                        
+                        # Set price for image rows from parent variant
+                        for idx in image_rows.index:
+                            shopify_df.at[idx, 'Variant Price'] = first_variant_price
+                            image_rows_fixed += 1
+                
+                if image_rows_fixed > 0:
+                    logger.info(f"Fixed {image_rows_fixed} image rows by inheriting prices from parent variants")
+            
+            # 8. FINAL DOUBLE CHECK: Ensure no zero prices remain (both variants AND single products AND image rows)
+            # CRITICAL: Parent rows WITH variants should NOT have Variant Price - exclude them from this check
             if 'Variant Price' in shopify_df.columns:
                 zero_price_count = 0
                 rows_to_remove_final = []
                 for idx, row in shopify_df.iterrows():
+                    title = row.get('Title', '')
+                    handle = row.get('Handle', '')
+                    is_parent_row = pd.notna(title) and str(title).strip() != ''
+                    
+                    # Check if this parent has variants (if yes, it shouldn't have Variant Price - skip check)
+                    if is_parent_row and handle:
+                        variant_rows = shopify_df[(shopify_df['Handle'] == handle) & 
+                                                  (shopify_df.index != idx) &
+                                                  ((shopify_df['Title'].isna()) | (shopify_df['Title'] == ''))]
+                        if len(variant_rows) > 0:
+                            # This is a parent with variants - it shouldn't have Variant Price, skip price check
+                            continue
+                    
+                    # For single products and variant/image rows, check price
                     variant_price = row.get('Variant Price', '')
-                    if variant_price and pd.notna(variant_price):
+                    # Check if price is missing or zero
+                    if not variant_price or pd.isna(variant_price) or str(variant_price).strip() == '' or str(variant_price).strip().lower() == 'nan':
+                        # Missing price - remove this row
+                        is_variant = pd.isna(title) or str(title).strip() == ''
+                        row_type = 'variant/image row' if is_variant else 'single product'
+                        logger.warning(f"Removing {row_type} with missing price: Handle={handle}, Title={str(title)[:50]}, SKU={row.get('Variant SKU', '')}")
+                        rows_to_remove_final.append(idx)
+                    else:
                         try:
                             price_val = float(str(variant_price).replace('₹', '').replace('$', '').replace(',', '').strip())
                             if price_val <= 0:
                                 zero_price_count += 1
-                                is_variant = pd.isna(row.get('Title')) or str(row.get('Title', '')).strip() == ''
-                                row_type = 'variant' if is_variant else 'single product'
-                                logger.error(f"CRITICAL: {row_type} still has zero price after all fixes: Handle={row.get('Handle', '')}, Title={str(row.get('Title', ''))[:50]}, SKU={row.get('Variant SKU', '')}")
+                                is_variant = pd.isna(title) or str(title).strip() == ''
+                                row_type = 'variant/image row' if is_variant else 'single product'
+                                logger.warning(f"Removing {row_type} with zero/negative price: Handle={handle}, Title={str(title)[:50]}, SKU={row.get('Variant SKU', '')}, Price={price_val}")
                                 rows_to_remove_final.append(idx)
                         except:
-                            pass
+                            # Can't parse price - remove it
+                            is_variant = pd.isna(title) or str(title).strip() == ''
+                            row_type = 'variant/image row' if is_variant else 'single product'
+                            logger.warning(f"Removing {row_type} with unparsable price: Handle={handle}, Price={variant_price}")
+                            rows_to_remove_final.append(idx)
                 
                 if rows_to_remove_final:
                     shopify_df = shopify_df.drop(rows_to_remove_final)
-                    logger.info(f"FINAL CLEANUP: Removed {len(rows_to_remove_final)} rows with zero prices")
+                    logger.info(f"FINAL CLEANUP: Removed {len(rows_to_remove_final)} rows (variants + single products + image rows) with zero/missing prices")
                     self.stats['failed_rows'] += len(rows_to_remove_final)
                 
                 if zero_price_count > 0:
@@ -1561,26 +1652,31 @@ class MigrationOrchestrator:
                 if fulfillment_fixes > 0:
                     logger.info(f"Fixed {fulfillment_fixes} rows (single products + variants) with fulfillment service set to 'manual'")
             
-            # 9. CRITICAL FIX: Ensure inventory policy values match Shopify's accepted values for ALL ROWS that have variant fields populated
+            # 9. CRITICAL FIX: Ensure inventory policy values match Shopify's accepted values for ALL VARIANT ROWS
             # Shopify accepts ONLY "deny" or "continue" (lowercase, exact match)
-            # - If Variant Price, Variant SKU, or Variant Inventory Qty is set, inventory policy MUST be set
+            # - ALL variant rows (rows without Title) MUST have inventory policy set
+            # - Rows with variant fields (Price, SKU, Inventory Qty) MUST have inventory policy set
             # - Parent rows WITH variants should have empty variant fields (no inventory policy needed)
             if 'Variant Inventory Policy' in shopify_df.columns:
                 policy_fixes = 0
                 for idx, row in shopify_df.iterrows():
+                    # Check if this is a variant row (no title or empty title)
+                    title = row.get('Title', '')
+                    is_variant_row = pd.isna(title) or str(title).strip() == ''
+                    
                     # Check if this row has any variant fields populated
                     variant_price = row.get('Variant Price', '')
                     variant_sku = row.get('Variant SKU', '')
                     variant_inventory = row.get('Variant Inventory Qty', '')
                     
-                    # If any variant field is populated, inventory policy must be set
                     has_variant_fields = (
                         (variant_price and pd.notna(variant_price) and str(variant_price).strip() != '' and str(variant_price).strip() != 'nan') or
                         (variant_sku and pd.notna(variant_sku) and str(variant_sku).strip() != '' and str(variant_sku).strip() != 'nan') or
                         (variant_inventory and pd.notna(variant_inventory) and str(variant_inventory).strip() != '' and str(variant_inventory).strip() != 'nan' and str(variant_inventory).strip() != '0')
                     )
                     
-                    if has_variant_fields:
+                    # If it's a variant row OR has variant fields, inventory policy must be set
+                    if is_variant_row or has_variant_fields:
                         policy = row.get('Variant Inventory Policy', '')
                         policy_str = str(policy).strip().lower() if pd.notna(policy) else ''
                         
@@ -1597,7 +1693,7 @@ class MigrationOrchestrator:
                             policy_fixes += 1
                 
                 if policy_fixes > 0:
-                    logger.info(f"Fixed {policy_fixes} rows with variant fields populated - set inventory policy to valid values ('deny' or 'continue')")
+                    logger.info(f"Fixed {policy_fixes} rows (variant rows + rows with variant fields) - set inventory policy to valid values ('deny' or 'continue')")
             
             # Shopify only accepts specific columns - remove columns that Shopify doesn't recognize
             # Keep only the columns that Shopify actually accepts
@@ -1622,6 +1718,147 @@ class MigrationOrchestrator:
             # Select only the accepted columns
             shopify_df = shopify_df[columns_to_keep]
             logger.info(f"Filtered to {len(columns_to_keep)} Shopify-accepted columns (removed {len(shopify_df.columns) - len(columns_to_keep) if len(shopify_df.columns) > len(columns_to_keep) else 0} unrecognized columns)")
+            
+            # FINAL SAFETY CHECK: Ensure ALL rows with blank titles have Option1 Value set
+            # This prevents "Title can't be blank" errors from Shopify
+            if 'Option1 Value' in shopify_df.columns and 'Title' in shopify_df.columns and 'Handle' in shopify_df.columns:
+                final_option1_fixes = 0
+                rows_to_remove_title_issue = []
+                for idx, row in shopify_df.iterrows():
+                    title = row.get('Title', '')
+                    option1_val = row.get('Option1 Value', '')
+                    handle = row.get('Handle', '')
+                    
+                    # Check if this is a variant row (empty Title)
+                    is_variant_row = pd.isna(title) or str(title).strip() == ''
+                    
+                    if is_variant_row:
+                        # This is a variant row - it MUST have Option1 Value
+                        if pd.isna(option1_val) or str(option1_val).strip() == '' or str(option1_val).strip().lower() == 'nan':
+                            # Try one more time to get Option1 Value from parent variant
+                            option1_found = False
+                            if handle and pd.notna(handle) and str(handle).strip() != '':
+                                handle_rows = shopify_df[shopify_df['Handle'] == handle]
+                                # Find variant rows with Option1 Value (excluding current row)
+                                variants_with_option1 = handle_rows[
+                                    (handle_rows.index != idx) &
+                                    (handle_rows['Title'].isna() | (handle_rows['Title'].astype(str).str.strip() == '')) &
+                                    (handle_rows['Option1 Value'].notna()) &
+                                    (handle_rows['Option1 Value'].astype(str).str.strip() != '') &
+                                    (handle_rows['Option1 Value'].astype(str).str.strip().str.lower() != 'nan')
+                                ]
+                                if len(variants_with_option1) > 0:
+                                    # Copy Option1 Value from first parent variant
+                                    parent_option1 = variants_with_option1.iloc[0]['Option1 Value']
+                                    shopify_df.at[idx, 'Option1 Value'] = str(parent_option1).strip()
+                                    option1_found = True
+                                    final_option1_fixes += 1
+                            
+                            # If still not found, try Variant SKU
+                            if not option1_found:
+                                variant_sku = row.get('Variant SKU', '')
+                                if variant_sku and pd.notna(variant_sku) and str(variant_sku).strip() != '':
+                                    shopify_df.at[idx, 'Option1 Value'] = str(variant_sku).strip()
+                                    final_option1_fixes += 1
+                                else:
+                                    # Last resort: remove this row as it's invalid
+                                    logger.warning(f"Removing row {idx} with blank title and no Option1 Value/SKU (Handle: {handle}) - cannot be fixed")
+                                    rows_to_remove_title_issue.append(idx)
+                            
+                            # Ensure Option1 Name is set
+                            if 'Option1 Name' in shopify_df.columns:
+                                option1_name = row.get('Option1 Name', '')
+                                if pd.isna(option1_name) or str(option1_name).strip() == '' or str(option1_name).strip().lower() == 'nan':
+                                    shopify_df.at[idx, 'Option1 Name'] = 'Size'
+                
+                if final_option1_fixes > 0:
+                    logger.info(f"Final safety check: Fixed {final_option1_fixes} more rows by setting Option1 Value")
+                
+                if rows_to_remove_title_issue:
+                    shopify_df = shopify_df.drop(rows_to_remove_title_issue)
+                    logger.warning(f"Final safety check: Removed {len(rows_to_remove_title_issue)} rows with blank titles that couldn't be fixed")
+                    self.stats['failed_rows'] += len(rows_to_remove_title_issue)
+            
+            # ULTRA-FINAL CHECK: Before writing CSV, ensure NO rows have blank titles without Option1 Value
+            # This is the absolute last check to prevent Shopify import errors
+            # Also ensure all titles are truly non-empty (not just whitespace)
+            if 'Option1 Value' in shopify_df.columns and 'Title' in shopify_df.columns:
+                ultra_final_removals = []
+                option1_fixes_ultra = 0
+                
+                for idx, row in shopify_df.iterrows():
+                    title_raw = row.get('Title', '')
+                    title = str(title_raw).strip() if pd.notna(title_raw) else ''
+                    option1_raw = row.get('Option1 Value', '')
+                    option1 = str(option1_raw).strip() if pd.notna(option1_raw) else ''
+                    handle = row.get('Handle', '')
+                    
+                    # Normalize empty values
+                    title_empty = not title or title == '' or title.lower() == 'nan' or title.lower() == 'none'
+                    option1_empty = not option1 or option1 == '' or option1.lower() == 'nan' or option1.lower() == 'none'
+                    
+                    # If title is empty/blank, Option1 Value MUST be non-empty
+                    if title_empty:
+                        if option1_empty:
+                            # Try to get Option1 Value from another variant with same handle
+                            if handle and pd.notna(handle) and str(handle).strip() != '':
+                                handle_rows = shopify_df[shopify_df['Handle'] == handle]
+                                variants_with_option1 = handle_rows[
+                                    (handle_rows.index != idx) &
+                                    (~handle_rows['Title'].apply(lambda x: bool(str(x).strip() if pd.notna(x) else ''))) &
+                                    (~handle_rows['Option1 Value'].apply(lambda x: not bool(str(x).strip() if pd.notna(x) else '')))
+                                ]
+                                if len(variants_with_option1) > 0:
+                                    parent_option1 = str(variants_with_option1.iloc[0]['Option1 Value']).strip()
+                                    shopify_df.at[idx, 'Option1 Value'] = parent_option1
+                                    option1_fixes_ultra += 1
+                                    continue
+                            
+                            # If still empty, try Variant SKU
+                            variant_sku = row.get('Variant SKU', '')
+                            if variant_sku and pd.notna(variant_sku) and str(variant_sku).strip() != '':
+                                shopify_df.at[idx, 'Option1 Value'] = str(variant_sku).strip()
+                                option1_fixes_ultra += 1
+                                continue
+                            
+                            # Last resort: remove this row
+                            logger.error(f"ULTRA-FINAL: Removing row {idx} with blank title and empty Option1 Value (Handle: {handle})")
+                            ultra_final_removals.append(idx)
+                        else:
+                            # Title is empty but Option1 is set - ensure it's a valid string
+                            if not option1 or len(option1) < 1:
+                                # Option1 is too short, set a default
+                                default_option1 = f"Variant-{idx}" if not handle else f"Variant-{handle}"
+                                shopify_df.at[idx, 'Option1 Value'] = default_option1
+                                option1_fixes_ultra += 1
+                    else:
+                        # Title is set - ensure it's not just whitespace
+                        if len(title) < 1:
+                            # Title is too short, this shouldn't happen but handle it
+                            logger.warning(f"ULTRA-FINAL: Row {idx} has very short title '{title}', ensuring Option1 Value is set")
+                            if option1_empty:
+                                default_option1 = f"Variant-{idx}" if not handle else f"Variant-{handle}"
+                                shopify_df.at[idx, 'Option1 Value'] = default_option1
+                                option1_fixes_ultra += 1
+                
+                if ultra_final_removals:
+                    shopify_df = shopify_df.drop(ultra_final_removals)
+                    logger.error(f"ULTRA-FINAL CHECK: Removed {len(ultra_final_removals)} rows that would cause 'Title can't be blank' errors")
+                    self.stats['failed_rows'] += len(ultra_final_removals)
+                
+                if option1_fixes_ultra > 0:
+                    logger.info(f"ULTRA-FINAL: Fixed {option1_fixes_ultra} rows by ensuring Option1 Value is set")
+                
+                # Final pass: Replace any NaN or empty strings in Option1 Value for variant rows
+                for idx, row in shopify_df.iterrows():
+                    title = str(row.get('Title', '')).strip() if pd.notna(row.get('Title')) else ''
+                    if not title or title == '':
+                        option1 = row.get('Option1 Value', '')
+                        if pd.isna(option1) or str(option1).strip() == '':
+                            handle = row.get('Handle', '')
+                            default_option1 = f"Variant-{idx}" if not handle else f"Variant-{handle}"
+                            shopify_df.at[idx, 'Option1 Value'] = default_option1
+                            logger.warning(f"ULTRA-FINAL PASS 2: Set Option1 Value for row {idx}")
             
             # Write output CSV
             self.csv_handler.write_csv(shopify_df, str(self.output_path))
