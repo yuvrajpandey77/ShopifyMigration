@@ -1,5 +1,5 @@
 files:
-  source_csv: "/home/yuvraj/Documents/products.csv"  # Path to your source products CSV file
+  source_csv: "/home/yuvraj/Documents/wc-product-export-28-11-2025-1764343496895.csv"  # Path to your source products CSV file
   shopify_template: "/home/yuvraj/Documents/product_template_csv_unit_price.csv"  # Path to Shopify template CSV file
   output_dir: "./data/output"
   category_mapping: "./config/category_mapping.json"  # Path to category mapping file (maps source categories to Shopify taxonomy)
