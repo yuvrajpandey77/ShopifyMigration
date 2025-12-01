@@ -421,6 +421,13 @@ class DataTransformer:
         # Basic HTML cleaning (remove script tags only - preserve everything else)
         html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
         
+        # Replace h1, h2, and h3 tags with h4 tags
+        html = re.sub(r'<h[1-3]([^>]*)>', r'<h4\1>', html, flags=re.IGNORECASE)
+        html = re.sub(r'</h[1-3]>', r'</h4>', html, flags=re.IGNORECASE)
+        
+        # Remove paragraphs containing field_* patterns (e.g., <p>field_65959a4267af5</p>)
+        html = re.sub(r'<p[^>]*>field_[^<]*</p>', '', html, flags=re.IGNORECASE)
+        
         # DO NOT remove colors - preserve original source formatting
         
         # Structure content into simple format with headings and paragraphs (NO TABS)
@@ -450,6 +457,13 @@ class DataTransformer:
         Returns:
             Structured HTML with headings and paragraphs (no tabs, only Overview and Specifications)
         """
+        # Replace h1, h2, and h3 tags with h4 tags before processing
+        content = re.sub(r'<h[1-3]([^>]*)>', r'<h4\1>', content, flags=re.IGNORECASE)
+        content = re.sub(r'</h[1-3]>', r'</h4>', content, flags=re.IGNORECASE)
+        
+        # Remove paragraphs containing field_* patterns before processing
+        content = re.sub(r'<p[^>]*>field_[^<]*</p>', '', content, flags=re.IGNORECASE)
+        
         # Check if content has explicit specification marker from mapper
         if '---SPECIFICATIONS---' in content:
             parts = content.split('---SPECIFICATIONS---')
@@ -547,6 +561,13 @@ class DataTransformer:
                 # Empty line - close current paragraph if any
                 if current_paragraph:
                     para_text = ' '.join(current_paragraph)
+                    # Skip paragraphs containing field_* patterns
+                    if re.search(r'field_[a-f0-9]+', para_text, re.IGNORECASE):
+                        current_paragraph = []
+                        continue
+                    # Replace h1, h2, and h3 with h4 in paragraph text
+                    para_text = re.sub(r'<h[1-3]([^>]*)>', r'<h4\1>', para_text, flags=re.IGNORECASE)
+                    para_text = re.sub(r'</h[1-3]>', r'</h4>', para_text, flags=re.IGNORECASE)
                     # Preserve original HTML if present, otherwise wrap in <p>
                     if para_text.startswith('<') and para_text.endswith('>'):
                         formatted.append(para_text)
@@ -557,6 +578,12 @@ class DataTransformer:
             
             # Check if line is already HTML
             if line.startswith('<') and line.endswith('>'):
+                # Skip paragraphs containing field_* patterns
+                if re.search(r'field_[a-f0-9]+', line, re.IGNORECASE):
+                    continue
+                # Replace h1, h2, and h3 with h4 in HTML tags
+                line = re.sub(r'<h[1-3]([^>]*)>', r'<h4\1>', line, flags=re.IGNORECASE)
+                line = re.sub(r'</h[1-3]>', r'</h4>', line, flags=re.IGNORECASE)
                 # Close current paragraph if any
                 if current_paragraph:
                     para_text = ' '.join(current_paragraph)
@@ -568,16 +595,24 @@ class DataTransformer:
                 # Add HTML line as-is (preserve original formatting)
                 formatted.append(line)
             else:
+                # Regular text - skip if it's a field_* pattern
+                if re.search(r'field_[a-f0-9]+', line, re.IGNORECASE):
+                    continue
                 # Regular text - add to current paragraph
                 current_paragraph.append(line)
         
         # Close any remaining paragraph
         if current_paragraph:
             para_text = ' '.join(current_paragraph)
-            if para_text.startswith('<') and para_text.endswith('>'):
-                formatted.append(para_text)
-            else:
-                formatted.append(f'<p>{para_text}</p>')
+            # Skip paragraphs containing field_* patterns
+            if not re.search(r'field_[a-f0-9]+', para_text, re.IGNORECASE):
+                # Replace h1, h2, and h3 with h4 in paragraph text
+                para_text = re.sub(r'<h[1-3]([^>]*)>', r'<h4\1>', para_text, flags=re.IGNORECASE)
+                para_text = re.sub(r'</h[1-3]>', r'</h4>', para_text, flags=re.IGNORECASE)
+                if para_text.startswith('<') and para_text.endswith('>'):
+                    formatted.append(para_text)
+                else:
+                    formatted.append(f'<p>{para_text}</p>')
         
         return '\n'.join(formatted) if formatted else '<p></p>'
     

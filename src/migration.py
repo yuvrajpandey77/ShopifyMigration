@@ -541,17 +541,10 @@ class MigrationOrchestrator:
                                 logger.info(f"Using variant image for parent product: {base_name}")
                                 break
                 
-                # CRITICAL: Skip products without images
+                # ALLOW products without images - set empty string instead of skipping
                 if not parent_images:
-                    logger.warning(f"Skipping product {base_name} - no images found in parent or variants")
-                    errors.append({
-                        'row_number': parent_row.name + 2,
-                        'type': 'missing_image',
-                        'errors': ['Missing Product image URL'],
-                        'row_data': {'base_name': base_name}
-                    })
-                    self.stats['failed_rows'] += len(variants) + 1
-                    continue
+                    logger.info(f"Product {base_name} has no images - migrating with empty image field")
+                    parent_images = [""]  # Set empty string to allow migration
                 
                 # Get handle for variants
                 handle = transformed_parent.get('URL handle', '')
@@ -692,17 +685,10 @@ class MigrationOrchestrator:
                     
                     parent_price = self._extract_source_price(parent_row)
                     
-                    # CRITICAL: Skip single products with zero or missing prices
+                    # ALLOW single products without prices - set default minimum price (0.01)
                     if not parent_price:
-                        logger.warning(f"Skipping single product {base_name} - no price in source data")
-                        errors.append({
-                            'row_number': parent_row.name + 2,
-                            'type': 'missing_price',
-                            'errors': ['Missing price for single product'],
-                            'row_data': {'base_name': base_name}
-                        })
-                        self.stats['failed_rows'] += 1
-                        continue
+                        logger.info(f"Single product {base_name} has no price - setting default price 0.01")
+                        parent_price = "0.01"  # Set minimum price to allow migration
                     
                     # Set price in Variant Price field for single products
                     if 'Price' in parent_shopify_row:
@@ -823,15 +809,13 @@ class MigrationOrchestrator:
                                         pass
                     
                     if not final_price_check or final_price_check <= 0:
-                        logger.warning(f"Skipping single product {base_name} - final price check failed (no valid price set in any field)")
-                        errors.append({
-                            'row_number': parent_row.name + 2,
-                            'type': 'zero_price_final_check',
-                            'errors': ['Single product has no valid price after processing'],
-                            'row_data': {'base_name': base_name, 'price_fields_checked': price_fields_to_check}
-                        })
-                        self.stats['failed_rows'] += 1
-                        continue
+                        # ALLOW single products without prices - set default minimum price
+                        logger.info(f"Single product {base_name} has no valid price - setting default price 0.01")
+                        if 'Variant Price' in parent_shopify_row:
+                            parent_shopify_row['Variant Price'] = "0.01"
+                        if 'Price' in parent_shopify_row:
+                            parent_shopify_row['Price'] = "0.01"
+                        final_price_check = 0.01  # Continue migration with default price
                 else:
                     # This product HAS VARIANTS
                     # CRITICAL: Parent product MUST NOT have ANY variant-specific fields populated
@@ -907,14 +891,14 @@ class MigrationOrchestrator:
                         image_urls = [url.strip() for url in str(variant_image_str).split(',') if url.strip()]
                         variant_images = [url for url in image_urls if url and url != 'nan']
                     
-                    # CRITICAL: Variants must have images (either their own or parent's)
+                    # ALLOW variants without images - use parent's image or empty string
                     if not variant_images:
                         if parent_image_first:
                             variant_images = [parent_image_first]
                         else:
-                            # Skip variant without image (parent also has no image)
-                            logger.warning(f"Skipping variant {variant_row.get('SKU', '')} - no image (parent also has no image)")
-                            continue
+                            # Allow variant without image - set empty string
+                            logger.info(f"Variant {variant_row.get('SKU', '')} has no image - migrating with empty image field")
+                            variant_images = [""]  # Set empty string to allow migration
                     
                     # Extract variant option value (try from name first, then SKU)
                     variant_option = self._extract_variant_option(
@@ -1100,19 +1084,20 @@ class MigrationOrchestrator:
                                         variant_shopify_row[col] = "shopify"
                                     break
                     
-                    # CRITICAL: Ensure variant has valid price sourced directly from the original data
+                    # ALLOW variants without prices - set default minimum price (0.01)
                     variant_price = self._extract_source_price(variant_row)
                     if not variant_price:
-                        logger.warning(f"Skipping variant with zero/invalid price: Handle={handle}, SKU={variant_row.get('SKU', '')}, Name={str(variant_row.get('Name', ''))[:50]}")
-                        continue  # Skip variants without valid price
-                    try:
-                        variant_price_value = float(variant_price)
-                        if variant_price_value <= 0:
-                            logger.warning(f"Skipping variant with zero price after parsing: Handle={handle}, SKU={variant_row.get('SKU', '')}")
-                            continue
-                    except Exception as e:
-                        logger.warning(f"Skipping variant with unparsable price '{variant_price}': Handle={handle}, error={e}")
-                        continue
+                        logger.info(f"Variant has no price - setting default price 0.01: Handle={handle}, SKU={variant_row.get('SKU', '')}")
+                        variant_price = "0.01"  # Set minimum price to allow migration
+                    else:
+                        try:
+                            variant_price_value = float(variant_price)
+                            if variant_price_value <= 0:
+                                logger.info(f"Variant has zero/negative price - setting default price 0.01: Handle={handle}, SKU={variant_row.get('SKU', '')}")
+                                variant_price = "0.01"  # Set minimum price to allow migration
+                        except Exception as e:
+                            logger.info(f"Variant has unparsable price '{variant_price}' - setting default price 0.01: Handle={handle}, error={e}")
+                            variant_price = "0.01"  # Set minimum price to allow migration
                     
                     # Set price in Variant Price (and Price if necessary)
                     for price_field in ['Price', 'Variant Price']:
@@ -1148,7 +1133,7 @@ class MigrationOrchestrator:
                 if not self._should_continue_on_error():
                     break
         
-        # CRITICAL: Remove any single products with zero prices that slipped through
+        # ALLOW all products - ensure single products without prices get default price
         # This is a final safety check - do it AFTER all rows are collected
         # First, build a map of handles to see which products have variants
         handle_to_has_variants = {}
@@ -1166,9 +1151,8 @@ class MigrationOrchestrator:
                     if sku and pd.notna(sku) and str(sku).strip() != '' and option1 and pd.notna(option1) and str(option1).strip() != '':
                         handle_to_has_variants[handle] = True
         
-        # Now filter out single products with zero prices
-        filtered_shopify_rows = []
-        removed_count = 0
+        # Now ensure single products without prices get default price (don't remove them)
+        fixed_count = 0
         for row in shopify_rows:
             title = row.get('Title', '')
             if title and pd.notna(title) and str(title).strip() != '':
@@ -1176,7 +1160,7 @@ class MigrationOrchestrator:
                 handle = row.get('URL handle', '') or row.get('Handle', '')
                 has_variants = handle_to_has_variants.get(handle, False) if handle else False
                 
-                # If no variants, it's a single product - must have valid price
+                # If no variants, it's a single product - ensure it has a price
                 if not has_variants:
                     price = None
                     for price_field in ['Price', 'Variant Price', 'Regular price']:
@@ -1191,15 +1175,15 @@ class MigrationOrchestrator:
                                 pass
                     
                     if not price or price <= 0:
-                        logger.warning(f"Removing single product '{title}' (handle: {handle}) - zero price detected in final filter")
-                        removed_count += 1
-                        continue  # Skip this row and all its image rows
-            
-            filtered_shopify_rows.append(row)
+                        # Set default price instead of removing
+                        logger.info(f"Single product '{title}' (handle: {handle}) has zero price - setting default price 0.01")
+                        for price_field in ['Price', 'Variant Price', 'Regular price']:
+                            if price_field in row:
+                                row[price_field] = "0.01"
+                        fixed_count += 1
         
-        if removed_count > 0:
-            logger.warning(f"Removed {removed_count} single products with zero prices in final filter")
-            shopify_rows = filtered_shopify_rows
+        if fixed_count > 0:
+            logger.info(f"Set default price (0.01) for {fixed_count} single products with zero prices")
         
         # Create output DataFrame
         if shopify_rows:
@@ -1345,32 +1329,40 @@ class MigrationOrchestrator:
                                 if not variant_image or str(variant_image).strip() == '' or str(variant_image).strip() == 'nan':
                                     shopify_df.at[idx, 'Variant Image'] = str(parent_image).strip()
             
-            # 3. CRITICAL FIX: Remove rows with zero prices (both variants AND single products)
+            # 3. ALLOW rows with zero/missing prices - set default minimum price (0.01) instead of removing
             if 'Variant Price' in shopify_df.columns:
-                rows_to_remove = []
+                rows_fixed = 0
                 for idx, row in shopify_df.iterrows():
-                        variant_price = row.get('Variant Price', '')
-                        if variant_price and pd.notna(variant_price):
-                            try:
-                                price_val = float(str(variant_price).replace('₹', '').replace('$', '').replace(',', '').strip())
-                                if price_val <= 0:
-                                    # Zero or negative price found - remove this row (both variants and single products)
-                                    is_variant = pd.isna(row.get('Title')) or str(row.get('Title', '')).strip() == ''
-                                    row_type = 'variant' if is_variant else 'single product'
-                                    logger.warning(f"Removing {row_type} with zero/negative price: Handle={row.get('Handle', '')}, Title={str(row.get('Title', ''))[:50]}, SKU={row.get('Variant SKU', '')}, Price={price_val}")
-                                    rows_to_remove.append(idx)
-                            except:
-                                # If price can't be parsed, check if it's empty
-                                if not variant_price or str(variant_price).strip() == '' or str(variant_price).strip() == 'nan':
-                                    is_variant = pd.isna(row.get('Title')) or str(row.get('Title', '')).strip() == ''
-                                    row_type = 'variant' if is_variant else 'single product'
-                                    logger.warning(f"Removing {row_type} with empty/invalid price: Handle={row.get('Handle', '')}, Title={str(row.get('Title', ''))[:50]}, SKU={row.get('Variant SKU', '')}")
-                                    rows_to_remove.append(idx)
+                    variant_price = row.get('Variant Price', '')
+                    # Only process rows that need price (variants and single products, not parent rows with variants)
+                    is_variant = pd.isna(row.get('Title')) or str(row.get('Title', '')).strip() == ''
+                    handle = row.get('Handle', '')
+                    
+                    # Check if this is a parent row with variants (should not have Variant Price)
+                    if not is_variant and handle:
+                        variant_rows = shopify_df[(shopify_df['Handle'] == handle) & 
+                                                  (shopify_df.index != idx) &
+                                                  (shopify_df['Title'].isna() | (shopify_df['Title'] == ''))]
+                        if len(variant_rows) > 0:
+                            continue  # Skip parent rows with variants
+                    
+                    # For variants and single products, ensure they have a price
+                    if not variant_price or pd.isna(variant_price) or str(variant_price).strip() == '' or str(variant_price).strip() == 'nan':
+                        shopify_df.at[idx, 'Variant Price'] = "0.01"
+                        rows_fixed += 1
+                    else:
+                        try:
+                            price_val = float(str(variant_price).replace('₹', '').replace('$', '').replace(',', '').strip())
+                            if price_val <= 0:
+                                shopify_df.at[idx, 'Variant Price'] = "0.01"
+                                rows_fixed += 1
+                        except:
+                            # If price can't be parsed, set default
+                            shopify_df.at[idx, 'Variant Price'] = "0.01"
+                            rows_fixed += 1
                 
-                if rows_to_remove:
-                    shopify_df = shopify_df.drop(rows_to_remove)
-                    logger.info(f"Removed {len(rows_to_remove)} rows (variants + single products) with zero/invalid prices")
-                    self.stats['failed_rows'] += len(rows_to_remove)
+                if rows_fixed > 0:
+                    logger.info(f"Set default price (0.01) for {rows_fixed} rows with zero/missing prices")
             
             # 4. CRITICAL FIX: Ensure variant Option1 Value and Name are set correctly
             # Variant rows (empty Title) MUST have Option1 Value set
@@ -1523,11 +1515,10 @@ class MigrationOrchestrator:
                 if image_rows_fixed > 0:
                     logger.info(f"Fixed {image_rows_fixed} image rows by inheriting prices from parent variants")
             
-            # 8. FINAL DOUBLE CHECK: Ensure no zero prices remain (both variants AND single products AND image rows)
-            # CRITICAL: Parent rows WITH variants should NOT have Variant Price - exclude them from this check
+            # 8. FINAL CHECK: Ensure all rows have prices (set default 0.01 if missing/zero)
+            # ALLOW all products - set default price instead of removing
             if 'Variant Price' in shopify_df.columns:
-                zero_price_count = 0
-                rows_to_remove_final = []
+                rows_fixed_final = 0
                 for idx, row in shopify_df.iterrows():
                     title = row.get('Title', '')
                     handle = row.get('Handle', '')
@@ -1542,38 +1533,27 @@ class MigrationOrchestrator:
                             # This is a parent with variants - it shouldn't have Variant Price, skip price check
                             continue
                     
-                    # For single products and variant/image rows, check price
+                    # For single products and variant/image rows, ensure they have a price
                     variant_price = row.get('Variant Price', '')
                     # Check if price is missing or zero
                     if not variant_price or pd.isna(variant_price) or str(variant_price).strip() == '' or str(variant_price).strip().lower() == 'nan':
-                        # Missing price - remove this row
-                        is_variant = pd.isna(title) or str(title).strip() == ''
-                        row_type = 'variant/image row' if is_variant else 'single product'
-                        logger.warning(f"Removing {row_type} with missing price: Handle={handle}, Title={str(title)[:50]}, SKU={row.get('Variant SKU', '')}")
-                        rows_to_remove_final.append(idx)
+                        # Missing price - set default
+                        shopify_df.at[idx, 'Variant Price'] = "0.01"
+                        rows_fixed_final += 1
                     else:
                         try:
                             price_val = float(str(variant_price).replace('₹', '').replace('$', '').replace(',', '').strip())
                             if price_val <= 0:
-                                zero_price_count += 1
-                                is_variant = pd.isna(title) or str(title).strip() == ''
-                                row_type = 'variant/image row' if is_variant else 'single product'
-                                logger.warning(f"Removing {row_type} with zero/negative price: Handle={handle}, Title={str(title)[:50]}, SKU={row.get('Variant SKU', '')}, Price={price_val}")
-                                rows_to_remove_final.append(idx)
+                                # Zero/negative price - set default
+                                shopify_df.at[idx, 'Variant Price'] = "0.01"
+                                rows_fixed_final += 1
                         except:
-                            # Can't parse price - remove it
-                            is_variant = pd.isna(title) or str(title).strip() == ''
-                            row_type = 'variant/image row' if is_variant else 'single product'
-                            logger.warning(f"Removing {row_type} with unparsable price: Handle={handle}, Price={variant_price}")
-                            rows_to_remove_final.append(idx)
+                            # Can't parse price - set default
+                            shopify_df.at[idx, 'Variant Price'] = "0.01"
+                            rows_fixed_final += 1
                 
-                if rows_to_remove_final:
-                    shopify_df = shopify_df.drop(rows_to_remove_final)
-                    logger.info(f"FINAL CLEANUP: Removed {len(rows_to_remove_final)} rows (variants + single products + image rows) with zero/missing prices")
-                    self.stats['failed_rows'] += len(rows_to_remove_final)
-                
-                if zero_price_count > 0:
-                    logger.error(f"CRITICAL: {zero_price_count} rows still had zero prices - they have been removed!")
+                if rows_fixed_final > 0:
+                    logger.info(f"Final check: Set default price (0.01) for {rows_fixed_final} rows with zero/missing prices")
             
             # 8. FINAL CHECK: Ensure ALL products have descriptions with proper HTML format
             desc_col = None
